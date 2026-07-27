@@ -1,0 +1,10 @@
+{
+  "model": "qingyan-liangce-agent",
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": "请对贵州茅台 600519 做一个 MA10/MA30 均线策略的研究回测，输出收益、回撤、交易次数和风险说明。"
+    }
+  ]
+}

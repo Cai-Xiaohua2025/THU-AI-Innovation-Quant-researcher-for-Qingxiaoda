@@ -1,0 +1,9 @@
+[project]
+name = "thu-ai-innovation-quant-researcher"
+version = "0.2.0"
+description = "Qingxiaoda-compatible compliant financial research agent for THU AI Innovation Competition"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

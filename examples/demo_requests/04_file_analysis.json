@@ -1,0 +1,22 @@
+{
+  "model": "qingyan-liangce-agent",
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "请结合附件内容，分析这家公司盈利质量、现金流风险和后续需要核验的公告事项。"
+        },
+        {
+          "type": "file",
+          "file": {
+            "url": "https://example.com/annual-report.pdf",
+            "filename": "annual-report.pdf"
+          }
+        }
+      ]
+    }
+  ]
+}

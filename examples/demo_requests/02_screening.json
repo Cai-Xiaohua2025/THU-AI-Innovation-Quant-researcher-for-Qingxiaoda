@@ -1,0 +1,10 @@
+{
+  "model": "qingyan-liangce-agent",
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": "请从内置 A 股股票池中做一个候选研究清单，综合考虑动量、趋势、波动、成交活跃度、财务质量和风险标签。"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "model": "qingyan-liangce-agent",
+  "stream": false,
+  "messages": [
+    {
+      "role": "user",
+      "content": "请分析宁德时代 300750 的近期走势、财报质量、近期公告线索和主要风险，输出可验证的研究结论。"
+    }
+  ]
+}
