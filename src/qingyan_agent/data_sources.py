@@ -44,7 +44,7 @@ class AShareDataClient:
         snapshot.statuses.extend([
             DataStatus("eastmoney_quote", bool(snapshot.quote.get("price")), snapshot.quote.get("message", "")),
             DataStatus("eastmoney_kline", bool(snapshot.klines), f"{len(snapshot.klines)} rows"),
-            DataStatus("fundamental", bool(snapshot.fundamentals), snapshot.fundamentals.get("_message", "")),
+            DataStatus("fundamental", has_data_fields(snapshot.fundamentals), snapshot.fundamentals.get("_message", "")),
             DataStatus("cninfo_announcement", bool(snapshot.announcements), f"{len(snapshot.announcements)} rows"),
         ])
         return snapshot
@@ -52,13 +52,16 @@ class AShareDataClient:
     def quote(self, target: Target) -> dict[str, Any]:
         cache_key = f"quote_{target.symbol}.json"
         cached = self._read_cache(cache_key, max_age_sec=30)
-        if cached:
+        if cached is not None:
             return cached
+        stale = self._read_cache(cache_key)
         secid = eastmoney_secid(target.symbol)
         url = "https://push2.eastmoney.com/api/qt/stock/get"
         params = {"secid": secid, "fields": "f43,f44,f45,f46,f47,f48,f57,f58,f60,f170"}
         try:
-            data = requests.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=self.settings.request_timeout_sec).json()
+            response = requests.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=self.settings.request_timeout_sec)
+            response.raise_for_status()
+            data = response.json()
             row = data.get("data") or {}
             price = normalize_em_price(row.get("f43"))
             result = {
@@ -77,13 +80,17 @@ class AShareDataClient:
             self._write_cache(cache_key, result)
             return result
         except Exception as exc:
+            if stale is not None:
+                stale["message"] = "using stale quote cache because live source is unavailable"
+                return stale
             return {"source": "eastmoney_push2", "message": f"quote unavailable: {str(exc)[:160]}"}
 
     def klines(self, target: Target, limit: int = 180) -> list[dict[str, Any]]:
         cache_key = f"kline_{target.symbol}_{limit}.json"
         cached = self._read_cache(cache_key, max_age_sec=180)
-        if cached:
+        if cached is not None:
             return cached
+        stale = self._read_cache(cache_key)
         secid = eastmoney_secid(target.symbol)
         url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
         params = {
@@ -96,7 +103,9 @@ class AShareDataClient:
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
         }
         try:
-            data = requests.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=self.settings.request_timeout_sec).json()
+            response = requests.get(url, params=params, headers=EASTMONEY_HEADERS, timeout=self.settings.request_timeout_sec)
+            response.raise_for_status()
+            data = response.json()
             rows = []
             for item in ((data.get("data") or {}).get("klines") or []):
                 parts = item.split(",")
@@ -114,16 +123,17 @@ class AShareDataClient:
             self._write_cache(cache_key, rows)
             return rows
         except Exception:
-            return []
+            return stale if isinstance(stale, list) else []
 
     def announcements(self, target: Target) -> list[dict[str, Any]]:
         cache_key = f"announcements_{target.symbol}.json"
         cached = self._read_cache(cache_key, max_age_sec=3600)
-        if cached:
+        if cached is not None:
             return cached
+        stale = self._read_cache(cache_key)
         today = datetime.now()
         start = today - timedelta(days=self.settings.announcement_lookback_days)
-        url = "http://www.cninfo.com.cn/new/hisAnnouncement/query"
+        url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
         payload = {
             "stock": f"{target.symbol},{target.name}",
             "tabName": "fulltext",
@@ -141,25 +151,26 @@ class AShareDataClient:
         }
         try:
             response = requests.post(url, data=payload, headers=CNINFO_HEADERS, timeout=self.settings.request_timeout_sec)
+            response.raise_for_status()
             data = response.json()
             rows = []
             for item in data.get("announcements") or []:
                 adjunct = item.get("adjunctUrl") or ""
                 rows.append({
                     "title": clean_html(item.get("announcementTitle") or ""),
-                    "date": item.get("announcementTime"),
-                    "url": f"http://static.cninfo.com.cn/{adjunct}" if adjunct else "",
+                    "date": format_cninfo_date(item.get("announcementTime")),
+                    "url": f"https://static.cninfo.com.cn/{adjunct}" if adjunct else "",
                     "source": "cninfo",
                 })
             self._write_cache(cache_key, rows)
             return rows
         except Exception:
-            return []
+            return stale if isinstance(stale, list) else []
 
     def fundamentals(self, target: Target) -> dict[str, Any]:
         cache_key = f"fundamental_{target.symbol}.json"
         cached = self._read_cache(cache_key, max_age_sec=86400)
-        if cached:
+        if cached is not None:
             return cached
         data: dict[str, Any] = {}
         if not self.settings.enable_akshare:
@@ -184,10 +195,12 @@ class AShareDataClient:
     def _cache_path(self, key: str) -> Path:
         return self.settings.cache_dir / key
 
-    def _read_cache(self, key: str, max_age_sec: int) -> Any:
+    def _read_cache(self, key: str, max_age_sec: int | None = None) -> Any:
         path = self._cache_path(key)
         try:
-            if not path.exists() or time.time() - path.stat().st_mtime > max_age_sec:
+            if not path.exists():
+                return None
+            if max_age_sec is not None and time.time() - path.stat().st_mtime > max_age_sec:
                 return None
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
@@ -195,6 +208,7 @@ class AShareDataClient:
 
     def _write_cache(self, key: str, value: Any) -> None:
         try:
+            self.settings.cache_dir.mkdir(parents=True, exist_ok=True)
             self._cache_path(key).write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         except Exception:
             pass
@@ -233,6 +247,16 @@ def clean_html(value: str) -> str:
     return str(value or "").replace("<em>", "").replace("</em>", "")
 
 
+def format_cninfo_date(value: Any) -> str:
+    try:
+        timestamp = float(value)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return str(value or "")
+
+
 def technical_indicators(rows: list[dict[str, Any]]) -> dict[str, Any]:
     closes = [to_float(row.get("close")) for row in rows if to_float(row.get("close")) is not None]
     volumes = [to_float(row.get("volume")) for row in rows if to_float(row.get("volume")) is not None]
@@ -269,3 +293,7 @@ def technical_indicators(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "volume_ratio_20d": round(vr, 2) if vr is not None else None,
         "trend_label": trend,
     }
+
+
+def has_data_fields(value: dict[str, Any]) -> bool:
+    return any(not str(key).startswith("_") for key in value)

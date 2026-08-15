@@ -40,6 +40,63 @@ $env:PYTHONPATH="src"
 python -m pytest tests -q
 ```
 
+## 生产部署
+
+仓库提供 Gunicorn、systemd 和 Nginx 配置，推荐拓扑为：
+
+```text
+公网 :8787 -> Nginx -> 127.0.0.1:18787 -> Gunicorn -> Flask
+```
+
+安装依赖后，可使用生产入口验证应用：
+
+```bash
+PYTHONPATH=src gunicorn --config gunicorn.conf.py wsgi:app
+```
+
+服务器部署文件：
+
+- `deploy/qingyan-agent.service`
+- `deploy/nginx-qingyan-agent.conf`
+
+正式接入建议为 `QINGYAN_PUBLIC_BASE_URL` 配置带有效证书的 HTTPS 公网域名。反向代理层必须关闭响应缓冲，确保 SSE 流式输出能实时到达清小搭。
+
+## 可选上游大模型
+
+系统支持接入任意 OpenAI-compatible Chat Completions 中转站。未配置上游时，系统继续使用本地行情、指标、回测和确定性模板；上游请求失败、超时或返回空内容时也会自动回退，不影响清小搭接口可用性。
+
+只需在 `.env` 填写：
+
+```dotenv
+QINGYAN_LLM_BASE_URL=https://your-gateway.example.com/v1
+QINGYAN_LLM_API_KEY=your-upstream-api-key
+QINGYAN_LLM_MODEL=your-model-name
+```
+
+`QINGYAN_LLM_BASE_URL` 支持三种形式：
+
+```text
+https://gateway.example.com
+https://gateway.example.com/v1
+https://gateway.example.com/v1/chat/completions
+```
+
+修改后重启：
+
+```bash
+sudo systemctl restart qingyan-agent
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:8787/health
+```
+
+当配置完整时，响应中的 `upstream_llm_configured` 为 `true`，`upstream_llm_model` 显示配置的模型名。
+
+本地 Python 代码仍负责行情、技术指标、选股评分和回测等数值计算；上游模型只负责复杂问题理解、证据综合、附件摘要分析和报告表达。附件摘要及结构化研究证据会发送给所配置的上游服务，因此不要使用不可信的中转站处理敏感材料。
+
 ## 清小搭接入配置
 
 - Base URL：部署后的公网地址，例如 `https://your-domain.example.com`
@@ -58,9 +115,23 @@ python -m pytest tests -q
 | `QINGYAN_PUBLIC_BASE_URL` | 空 | 公网地址，用于生成附件 URL |
 | `QINGYAN_REPORT_DIR` | `outputs/reports` | 报告输出目录 |
 | `QINGYAN_CACHE_DIR` | `outputs/cache` | 数据缓存目录 |
+| `QINGYAN_MAX_REQUEST_BYTES` | `2097152` | API 请求体大小上限 |
+| `QINGYAN_MAX_DOWNLOAD_BYTES` | `26214400` | 单个远程附件下载上限 |
+| `QINGYAN_MAX_FILES_PER_REQUEST` | `5` | 单次请求允许的附件数量 |
+| `QINGYAN_REQUEST_TIMEOUT_SEC` | `12` | 外部数据源和附件请求超时 |
 | `QINGYAN_ANNOUNCEMENT_LOOKBACK_DAYS` | `180` | 公告检索回看天数 |
+| `QINGYAN_ALLOW_PRIVATE_FILE_URLS` | `false` | 是否允许下载私网附件 URL；公网部署不建议开启 |
+| `QINGYAN_TRUSTED_PROXY_COUNT` | `0` | 可信反向代理层数；使用仓库 Nginx 配置时设为 `1` |
+| `QINGYAN_CORS_ORIGINS` | `*` | 允许跨域访问的来源列表 |
 | `QINGYAN_BACKTEST_GATEWAY_URL` | 空 | 可选外部回测网关地址 |
 | `QINGYAN_BACKTEST_GATEWAY_TOKEN` | 空 | 可选外部回测 token |
+| `QINGYAN_LLM_BASE_URL` | 空 | OpenAI-compatible 上游地址；留空则禁用上游模型 |
+| `QINGYAN_LLM_API_KEY` | 空 | 上游中转站 API Key |
+| `QINGYAN_LLM_MODEL` | 空 | 上游实际模型名称 |
+| `QINGYAN_LLM_TIMEOUT_SEC` | `90` | 上游请求总读取超时 |
+| `QINGYAN_LLM_MAX_TOKENS` | `1800` | 上游单次最大生成 Token 数 |
+| `QINGYAN_LLM_MAX_INPUT_CHARS` | `60000` | 发送给上游的最大证据字符数 |
+| `QINGYAN_LLM_TEMPERATURE` | `0.2` | 上游生成温度 |
 | `QINGYAN_ENABLE_AKSHARE` | `false` | 是否启用可选 akshare 财务字段；演示时默认关闭以提升稳定性 |
 
 ## 演示请求

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from .data_sources import AShareDataClient
 from .models import DataStatus, ScreeningResult, Target
 from .universe import DEFAULT_A_SHARE_UNIVERSE
@@ -15,21 +17,29 @@ class StockScreener:
         targets = universe or DEFAULT_A_SHARE_UNIVERSE
         rows = []
         statuses: list[DataStatus] = []
-        for target in targets:
-            snapshot = self.data_client.collect(target)
-            statuses.extend(snapshot.statuses)
-            score, factors = score_snapshot(snapshot)
-            rows.append({
-                "market": target.market,
-                "symbol": target.symbol,
-                "name": target.name,
-                "sector": target.sector,
-                "score": score,
-                "factors": factors,
-                "risk_tags": risk_tags(snapshot, factors),
-            })
+        worker_count = min(6, max(1, len(targets)))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="qingyan-screen") as executor:
+            futures = {executor.submit(self.data_client.collect, target): target for target in targets}
+            for future in as_completed(futures):
+                target = futures[future]
+                try:
+                    snapshot = future.result()
+                except Exception as exc:
+                    statuses.append(DataStatus(f"screen:{target.symbol}", False, f"collect failed: {str(exc)[:120]}"))
+                    continue
+                statuses.extend(snapshot.statuses)
+                score, factors = score_snapshot(snapshot)
+                rows.append({
+                    "market": target.market,
+                    "symbol": target.symbol,
+                    "name": target.name,
+                    "sector": target.sector,
+                    "score": score,
+                    "factors": factors,
+                    "risk_tags": risk_tags(snapshot, factors),
+                })
         rows.sort(key=lambda item: item["score"], reverse=True)
-        return ScreeningResult("default_a_share_research_universe", rows[:limit], statuses)
+        return ScreeningResult("default_a_share_research_universe", rows[:max(1, limit)], statuses)
 
 
 def score_snapshot(snapshot) -> tuple[float, dict]:

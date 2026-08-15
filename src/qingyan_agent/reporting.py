@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 from .config import Settings
 
@@ -26,7 +28,7 @@ class ReportService:
     def create(self, title: str, markdown: str, charts: list[Path] | None = None) -> ReportArtifacts:
         self.settings.report_dir.mkdir(parents=True, exist_ok=True)
         stem = safe_name(title) or "qingyan_research_report"
-        stamp = time.strftime("%Y%m%d_%H%M%S")
+        stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         md_path = self.settings.report_dir / f"{stem}_{stamp}.md"
         pdf_path = self.settings.report_dir / f"{stem}_{stamp}.pdf"
         chart_paths = charts or []
@@ -41,7 +43,7 @@ class ReportService:
 
     def attachment(self, path: Path, file_type: str, mime_type: str) -> dict:
         base = self.settings.public_base_url or self.request_base_url
-        file_url = f"{base}/files/{path.name}" if base else path.resolve().as_uri()
+        file_url = f"{base}/files/{quote(path.name)}" if base else path.resolve().as_uri()
         return {
             "fileUrl": file_url,
             "fileName": path.name,
@@ -126,7 +128,8 @@ class ChartService:
 
     def _chart_path(self, title: str, kind: str) -> Path:
         self.settings.report_dir.mkdir(parents=True, exist_ok=True)
-        return self.settings.report_dir / f"{safe_name(title)}_{kind}_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        suffix = uuid.uuid4().hex[:8]
+        return self.settings.report_dir / f"{safe_name(title)}_{kind}_{time.strftime('%Y%m%d_%H%M%S')}_{suffix}.png"
 
 
 def safe_name(value: str) -> str:
@@ -134,13 +137,29 @@ def safe_name(value: str) -> str:
 
 
 def configure_matplotlib_zh(plt) -> None:
-    for font in ("Microsoft YaHei", "SimHei", "SimSun", "Arial Unicode MS"):
-        try:
-            plt.rcParams["font.sans-serif"] = [font, "DejaVu Sans"]
-            plt.rcParams["axes.unicode_minus"] = False
-            return
-        except Exception:
-            pass
+    candidates = (
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "Source Han Sans SC",
+        "Microsoft YaHei",
+        "SimHei",
+        "SimSun",
+        "Arial Unicode MS",
+    )
+    try:
+        from matplotlib import font_manager
+        for path in (
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        ):
+            if Path(path).exists():
+                font_manager.fontManager.addfont(path)
+        installed = {item.name for item in font_manager.fontManager.ttflist}
+        selected = next((font for font in candidates if font in installed), "DejaVu Sans")
+        plt.rcParams["font.sans-serif"] = [selected, "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        plt.rcParams["axes.unicode_minus"] = False
 
 
 def write_pdf(path: Path, markdown: str, chart_paths: list[Path]) -> bool:
@@ -148,10 +167,20 @@ def write_pdf(path: Path, markdown: str, chart_paths: list[Path]) -> bool:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.utils import ImageReader
         from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.pdfgen import canvas
-        font_name = "Helvetica"
-        for candidate in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc"):
+        font_name = "STSong-Light"
+        try:
+            pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+        except Exception:
+            font_name = "Helvetica"
+        for candidate in (
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/simsun.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+        ):
             if Path(candidate).exists():
                 try:
                     pdfmetrics.registerFont(TTFont("QingyanFont", candidate))
@@ -159,7 +188,7 @@ def write_pdf(path: Path, markdown: str, chart_paths: list[Path]) -> bool:
                     break
                 except Exception:
                     pass
-        page_width, page_height = A4
+        _, page_height = A4
         c = canvas.Canvas(str(path), pagesize=A4)
         c.setFont(font_name, 10)
         y = page_height - 45

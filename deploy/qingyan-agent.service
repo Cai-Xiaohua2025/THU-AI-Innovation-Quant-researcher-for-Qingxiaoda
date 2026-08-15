@@ -1,0 +1,25 @@
+[Unit]
+Description=Qingyan Liangce Qingxiaoda-compatible API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/qingyan-agent
+EnvironmentFile=/opt/qingyan-agent/.env
+Environment=PYTHONPATH=/opt/qingyan-agent/src
+Environment=QINGYAN_TRUSTED_PROXY_COUNT=1
+Environment=QINGYAN_GUNICORN_BIND=127.0.0.1:18787
+ExecStart=/opt/qingyan-agent/.venv/bin/gunicorn --config /opt/qingyan-agent/gunicorn.conf.py wsgi:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillSignal=SIGQUIT
+TimeoutStopSec=35
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

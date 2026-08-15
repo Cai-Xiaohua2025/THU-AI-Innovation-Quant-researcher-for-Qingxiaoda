@@ -21,11 +21,20 @@ class ParsedRequest:
     model: str
     stream: bool
     prompt: str
+    max_tokens: int | None = None
     files: list[InputFile] = field(default_factory=list)
 
 
 def parse_request(payload: dict[str, Any]) -> ParsedRequest:
-    messages = payload.get("messages") or []
+    if not isinstance(payload, dict):
+        raise ValueError("request body must be a JSON object")
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages must be a non-empty array")
+    stream = payload.get("stream", False)
+    if not isinstance(stream, bool):
+        raise ValueError("stream must be a boolean")
+
     texts: list[str] = []
     files: list[InputFile] = []
     for message in messages:
@@ -52,15 +61,40 @@ def parse_request(payload: dict[str, Any]) -> ParsedRequest:
                         url=str(f.get("url") or ""),
                         file_id=str(f.get("file_id") or ""),
                     ))
+    prompt = "\n".join(texts).strip()
+    if not prompt and not files:
+        raise ValueError("messages must contain text or a supported file part")
+
+    max_tokens = payload.get("max_completion_tokens", payload.get("max_tokens"))
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool):
+            raise ValueError("max_tokens must be a positive integer")
+        try:
+            max_tokens = int(max_tokens)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_tokens must be a positive integer") from exc
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be a positive integer")
+
+    model = str(payload.get("model") or "qingyan-liangce-agent").strip()
+    if len(model) > 128:
+        raise ValueError("model is too long")
     return ParsedRequest(
-        model=str(payload.get("model") or "qingyan-liangce-agent"),
-        stream=bool(payload.get("stream", False)),
-        prompt="\n".join(texts).strip(),
+        model=model,
+        stream=stream,
+        prompt=prompt,
+        max_tokens=max_tokens,
         files=files,
     )
 
 
-def completion_response(model: str, content: str, attachments: list[dict[str, Any]]) -> dict[str, Any]:
+def completion_response(
+    model: str,
+    prompt: str,
+    content: str,
+    attachments: list[dict[str, Any]] | None = None,
+    finish_reason: str = "stop",
+) -> dict[str, Any]:
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -69,14 +103,20 @@ def completion_response(model: str, content: str, attachments: list[dict[str, An
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
         }],
-        "usage": estimate_usage(content),
-        "x_soda": {"attachments": attachments},
+        "usage": estimate_usage(prompt, content),
+        "x_soda": {"attachments": attachments or []},
     }
 
 
-def stream_response(model: str, content: str, attachments: list[dict[str, Any]]) -> Iterable[str]:
+def stream_response(
+    model: str,
+    prompt: str,
+    content: str,
+    attachments: list[dict[str, Any]] | None = None,
+    finish_reason: str = "stop",
+) -> Iterable[str]:
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     yield "data: " + json.dumps({
@@ -99,14 +139,50 @@ def stream_response(model: str, content: str, attachments: list[dict[str, Any]])
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        "usage": estimate_usage(content),
-        "x_soda": {"attachments": attachments},
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+        "usage": estimate_usage(prompt, content),
+        "x_soda": {"attachments": attachments or []},
     }
     yield "data: " + json.dumps(stop, ensure_ascii=False) + "\n\n"
     yield "data: [DONE]\n\n"
 
 
-def estimate_usage(content: str) -> dict[str, int]:
-    token_estimate = max(1, len(content or "") // 4)
-    return {"prompt_tokens": token_estimate, "completion_tokens": token_estimate, "total_tokens": token_estimate * 2}
+def estimate_usage(prompt: str, content: str) -> dict[str, int]:
+    prompt_tokens = estimate_tokens(prompt)
+    completion_tokens = estimate_tokens(content)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+def truncate_to_token_budget(content: str, max_tokens: int | None) -> str:
+    """Apply a conservative character-based limit for OpenAI-compatible clients."""
+    if max_tokens is None:
+        return content
+    if estimate_tokens(content) <= max_tokens:
+        return content
+
+    result: list[str] = []
+    budget_units = max_tokens * 4
+    used_units = 0
+    for character in content:
+        character_units = 4 if ord(character) > 127 else 1
+        if used_units + character_units > budget_units:
+            break
+        result.append(character)
+        used_units += character_units
+    return "".join(result).rstrip()
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate tokens without requiring a model-specific tokenizer.
+
+    CJK characters are conservatively counted as one token and ASCII text as
+    roughly four characters per token. The number is for compatibility metadata,
+    not billing.
+    """
+    value = text or ""
+    units = sum(4 if ord(character) > 127 else 1 for character in value)
+    return max(1, (units + 3) // 4)

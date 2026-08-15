@@ -10,6 +10,7 @@ from .backtest import BacktestService
 from .compliance import guard_output, normalize_question
 from .data_sources import AShareDataClient
 from .file_reader import FileSummary
+from .llm_client import LLMResult, UpstreamLLMClient
 from .models import BacktestResult, MarketSnapshot, ResearchOutput, ScreeningResult, Target
 from .reporting import ChartService
 from .screening import StockScreener
@@ -17,11 +18,19 @@ from .universe import infer_intent, infer_target
 
 
 class ResearchAgent:
-    def __init__(self, data_client: AShareDataClient, screener: StockScreener, backtester: BacktestService, chart_service: ChartService) -> None:
+    def __init__(
+        self,
+        data_client: AShareDataClient,
+        screener: StockScreener,
+        backtester: BacktestService,
+        chart_service: ChartService,
+        llm_client: UpstreamLLMClient | None = None,
+    ) -> None:
         self.data_client = data_client
         self.screener = screener
         self.backtester = backtester
         self.chart_service = chart_service
+        self.llm_client = llm_client
 
     def run(self, prompt: str, files: list[FileSummary]) -> tuple[ResearchOutput, list[Path]]:
         question = normalize_question(prompt or "")
@@ -36,9 +45,17 @@ class ResearchAgent:
             if chart:
                 charts.append(chart)
             title = "候选股票池研究报告"
-            answer = compose_screening_answer(screening)
-            report = compose_report(title, question, {"screening": screening.rows}, file_notes, answer)
-            return ResearchOutput(title, guard_output(answer), report), charts
+            deterministic_answer = compose_screening_answer(screening)
+            evidence = {
+                "screening": screening.rows,
+                "data_statuses": [status.__dict__ for status in screening.statuses],
+                "attachments": file_notes,
+            }
+            answer, llm_result = self.synthesize(question, intent, evidence, deterministic_answer)
+            answer = guard_output(answer)
+            evidence["upstream_llm"] = llm_result.public_metadata(self.llm_configured)
+            report = compose_report(title, question, evidence, file_notes, answer)
+            return ResearchOutput(title, answer, report), charts
 
         snapshot = self.data_client.collect(target)
         if snapshot.klines:
@@ -54,8 +71,6 @@ class ResearchAgent:
                 charts.append(chart)
 
         title = build_title(target, intent)
-        answer = compose_single_answer(question, target, intent, snapshot, file_notes, backtest_result)
-        answer = guard_output(answer)
         report_payload = {
             "target": target.__dict__ if target else None,
             "quote": snapshot.quote,
@@ -64,9 +79,35 @@ class ResearchAgent:
             "announcements": snapshot.announcements[:8],
             "statuses": [status.__dict__ for status in snapshot.statuses],
             "backtest": backtest_result.metrics if backtest_result else None,
+            "attachments": file_notes,
         }
+        deterministic_answer = compose_single_answer(question, target, intent, snapshot, file_notes, backtest_result)
+        answer, llm_result = self.synthesize(question, intent, report_payload, deterministic_answer)
+        answer = guard_output(answer)
+        report_payload["upstream_llm"] = llm_result.public_metadata(self.llm_configured)
         report = compose_report(title, question, report_payload, file_notes, answer)
         return ResearchOutput(title, answer, report), charts
+
+    @property
+    def llm_configured(self) -> bool:
+        return bool(self.llm_client and self.llm_client.configured)
+
+    def synthesize(
+        self,
+        question: str,
+        intent: str,
+        evidence: dict,
+        deterministic_answer: str,
+    ) -> tuple[str, LLMResult]:
+        if not self.llm_client:
+            return deterministic_answer, LLMResult()
+        result = self.llm_client.synthesize(
+            question=question,
+            intent=intent,
+            evidence=evidence,
+            deterministic_draft=deterministic_answer,
+        )
+        return (result.content if result.used else deterministic_answer), result
 
 
 def build_title(target: Target | None, intent: str) -> str:

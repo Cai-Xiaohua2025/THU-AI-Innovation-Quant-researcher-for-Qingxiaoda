@@ -40,6 +40,41 @@ $env:PYTHONPATH="src"
 python -m pytest tests -q
 ```
 
+## Production Deployment
+
+The repository includes Gunicorn, systemd, and Nginx configurations. The recommended topology is:
+
+```text
+public :8787 -> Nginx -> 127.0.0.1:18787 -> Gunicorn -> Flask
+```
+
+After installing dependencies, validate the production entrypoint with:
+
+```bash
+PYTHONPATH=src gunicorn --config gunicorn.conf.py wsgi:app
+```
+
+Deployment templates are available in:
+
+- `deploy/qingyan-agent.service`
+- `deploy/nginx-qingyan-agent.conf`
+
+For a public Qingxiaoda integration, configure `QINGYAN_PUBLIC_BASE_URL` with an HTTPS URL backed by a valid certificate. Response buffering must remain disabled at the reverse proxy so SSE chunks reach the client immediately.
+
+## Optional Upstream LLM
+
+The service can use any OpenAI-compatible Chat Completions gateway. When it is not configured, or when it times out or fails, the deterministic local research workflow remains available.
+
+Configure these values in `.env`:
+
+```dotenv
+QINGYAN_LLM_BASE_URL=https://your-gateway.example.com/v1
+QINGYAN_LLM_API_KEY=your-upstream-api-key
+QINGYAN_LLM_MODEL=your-model-name
+```
+
+The base URL may be a host root, a `/v1` URL, or the complete `/v1/chat/completions` endpoint. Restart `qingyan-agent` after changing the configuration. Market data, indicators, screening scores, and backtests remain local deterministic computations; the upstream model is used only for question understanding, evidence synthesis, attachment-summary analysis, and report writing. Evidence and attachment excerpts are sent to the configured upstream service, so use a trusted provider for sensitive material.
+
 ## Qingxiaoda Setup
 
 - Base URL: deployed public URL, for example `https://your-domain.example.com`
@@ -58,9 +93,23 @@ python -m pytest tests -q
 | `QINGYAN_PUBLIC_BASE_URL` | empty | Public URL for attachment links |
 | `QINGYAN_REPORT_DIR` | `outputs/reports` | Report output directory |
 | `QINGYAN_CACHE_DIR` | `outputs/cache` | Data cache directory |
+| `QINGYAN_MAX_REQUEST_BYTES` | `2097152` | Maximum API request body size |
+| `QINGYAN_MAX_DOWNLOAD_BYTES` | `26214400` | Maximum remote attachment size |
+| `QINGYAN_MAX_FILES_PER_REQUEST` | `5` | Maximum attachments per request |
+| `QINGYAN_REQUEST_TIMEOUT_SEC` | `12` | External data and attachment request timeout |
 | `QINGYAN_ANNOUNCEMENT_LOOKBACK_DAYS` | `180` | Announcement lookback window |
+| `QINGYAN_ALLOW_PRIVATE_FILE_URLS` | `false` | Allow private-network attachment URLs; not recommended for public deployments |
+| `QINGYAN_TRUSTED_PROXY_COUNT` | `0` | Number of trusted reverse proxies; use `1` with the provided Nginx configuration |
+| `QINGYAN_CORS_ORIGINS` | `*` | Comma-separated allowed CORS origins |
 | `QINGYAN_BACKTEST_GATEWAY_URL` | empty | Optional external backtest gateway |
 | `QINGYAN_BACKTEST_GATEWAY_TOKEN` | empty | Optional external backtest token |
+| `QINGYAN_LLM_BASE_URL` | empty | OpenAI-compatible upstream address; empty disables the upstream model |
+| `QINGYAN_LLM_API_KEY` | empty | Upstream gateway API key |
+| `QINGYAN_LLM_MODEL` | empty | Actual upstream model name |
+| `QINGYAN_LLM_TIMEOUT_SEC` | `90` | Upstream response timeout |
+| `QINGYAN_LLM_MAX_TOKENS` | `1800` | Maximum upstream output tokens |
+| `QINGYAN_LLM_MAX_INPUT_CHARS` | `60000` | Maximum evidence characters sent upstream |
+| `QINGYAN_LLM_TEMPERATURE` | `0.2` | Upstream generation temperature |
 | `QINGYAN_ENABLE_AKSHARE` | `false` | Enable optional akshare financial fields; disabled by default for faster demos |
 
 ## Demo Requests
