@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import mimetypes
 import ipaddress
 import socket
@@ -15,12 +16,14 @@ from xml.etree import ElementTree
 import requests
 
 from .config import Settings
-from .protocol import InputFile
+from .protocol import InputFile, InputImage
 
 
 DOWNLOAD_HEADERS = {"User-Agent": "Qingyan-Liangce-Agent/0.3 (+file-ingestion)"}
 MAX_REDIRECTS = 3
 MAX_EXTRACTED_ARCHIVE_BYTES = 80 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000
+SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 
 @dataclass
@@ -30,6 +33,17 @@ class FileSummary:
     mime_type: str = ""
     text: str = ""
     source_url: str = ""
+
+
+@dataclass
+class ImageSummary:
+    filename: str
+    status: str
+    mime_type: str = ""
+    source_url: str = ""
+    data_url: str = ""
+    width: int | None = None
+    height: int | None = None
 
 
 class FileReader:
@@ -69,6 +83,44 @@ class FileReader:
             )
         except Exception as exc:
             return FileSummary(filename=filename, status=f"read failed: {str(exc)[:180]}", source_url=item.url)
+
+    def read_images(self, images: list[InputImage]) -> list[ImageSummary]:
+        return [self.read_image(item) for item in images]
+
+    def read_image(self, item: InputImage) -> ImageSummary:
+        filename = Path(urlsplit(item.url).path).name or "uploaded_image"
+        try:
+            response, final_url = download_response(
+                item.url,
+                timeout=self.settings.request_timeout_sec,
+                allow_private=self.settings.allow_private_file_urls,
+            )
+            try:
+                declared_size = response.headers.get("Content-Length", "").strip()
+                if declared_size and int(declared_size) > self.settings.max_image_bytes:
+                    raise ValueError(f"image exceeds limit: {self.settings.max_image_bytes} bytes")
+                content = read_limited(response, self.settings.max_image_bytes)
+                declared_mime = response.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            finally:
+                response.close()
+            mime, width, height = inspect_image(content)
+            if declared_mime and declared_mime not in {mime, "application/octet-stream", "binary/octet-stream"}:
+                raise ValueError(f"URL did not return an image Content-Type: {declared_mime}")
+            return ImageSummary(
+                filename=Path(urlsplit(final_url).path).name or filename,
+                status="ok",
+                mime_type=mime,
+                source_url=final_url,
+                data_url=f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}",
+                width=width,
+                height=height,
+            )
+        except Exception as exc:
+            return ImageSummary(
+                filename=filename,
+                status=f"read failed: {str(exc)[:180]}",
+                source_url=item.url,
+            )
 
 
 def download_response(url: str, *, timeout: int, allow_private: bool) -> tuple[requests.Response, str]:
@@ -130,6 +182,27 @@ def read_limited(response: requests.Response, limit: int) -> bytes:
         if len(buffer) > limit:
             raise ValueError(f"file exceeds limit: {limit} bytes")
     return bytes(buffer)
+
+
+def inspect_image(content: bytes) -> tuple[str, int, int]:
+    if not content:
+        raise ValueError("image is empty")
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(content)) as image:
+            image.verify()
+        with Image.open(BytesIO(content)) as image:
+            width, height = image.size
+            image_format = str(image.format or "").upper()
+    except Exception as exc:
+        raise ValueError("downloaded content is not a valid image") from exc
+    if width < 1 or height < 1 or width * height > MAX_IMAGE_PIXELS:
+        raise ValueError(f"image dimensions exceed limit: {MAX_IMAGE_PIXELS} pixels")
+    mime = Image.MIME.get(image_format, "").lower()
+    if mime not in SUPPORTED_IMAGE_MIMES:
+        raise ValueError(f"unsupported image format: {image_format or 'unknown'}")
+    return mime, width, height
 
 
 def extract_text(content: bytes, filename: str, mime: str) -> str:

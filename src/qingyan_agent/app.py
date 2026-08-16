@@ -20,6 +20,7 @@ except Exception:
 
 from .backtest import BacktestService
 from .config import Settings, load_settings
+from .conversation_store import ConversationStore
 from .data_sources import AShareDataClient
 from .file_reader import FileReader
 from .llm_client import UpstreamLLMClient
@@ -56,6 +57,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     llm_client = UpstreamLLMClient(cfg)
     agent = ResearchAgent(data_client, screener, backtester, charts, llm_client)
     reader = FileReader(cfg)
+    conversation_store = ConversationStore(cfg)
 
     @app.before_request
     def start_request() -> None:
@@ -86,6 +88,13 @@ def create_app(settings: Settings | None = None) -> Flask:
             "service": "qingyan-liangce-agent",
             "openai_compatible": True,
             "qingxiaoda_attachments": True,
+            "vision_image_url": True,
+            "market_data_mode": "online_with_short_cache",
+            "supported_a_share_markets": ["SSE", "SZSE", "BSE"],
+            "market_quote_sources": ["tencent", "sina", "eastmoney"],
+            "announcement_attachment_extraction": True,
+            "announcement_attachment_max_files": cfg.announcement_attachment_max_files,
+            "conversation_storage_enabled": cfg.save_conversations,
             "upstream_llm_configured": cfg.llm_configured,
             "upstream_llm_model": cfg.llm_model if cfg.llm_configured else "",
             "live_trading_enabled": cfg.live_trading_enabled,
@@ -97,6 +106,8 @@ def create_app(settings: Settings | None = None) -> Flask:
             "report_dir": directory_ready(cfg.report_dir),
             "cache_dir": directory_ready(cfg.cache_dir),
         }
+        if cfg.save_conversations:
+            checks["conversation_dir"] = conversation_store.ensure_ready()
         is_ready = all(checks.values())
         return jsonify({"status": "ready" if is_ready else "not_ready", "checks": checks}), 200 if is_ready else 503
 
@@ -133,24 +144,45 @@ def create_app(settings: Settings | None = None) -> Flask:
                 return configure_stream_response(response)
             return jsonify(completion_response(parsed.model, parsed.prompt, content))
 
-        if len(parsed.files) > cfg.max_files_per_request:
+        if len(parsed.files) + len(parsed.images) > cfg.max_files_per_request:
             return api_error(
-                f"too many files; maximum is {cfg.max_files_per_request}",
+                f"too many files or images; maximum is {cfg.max_files_per_request}",
                 "invalid_request_error",
                 400,
             )
         files = reader.read_all(parsed.files)
-        output, chart_paths = agent.run(parsed.prompt, files)
-        report = ReportService(cfg, request.url_root.rstrip("/")).create(output.title, output.report_markdown, chart_paths)
+        images = reader.read_images(parsed.images)
+        output, chart_paths = agent.run(parsed.prompt, files, images)
+        attachments = output.attachments
+        if output.report_enabled:
+            report = ReportService(cfg, request.url_root.rstrip("/")).create(output.title, output.report_markdown, chart_paths)
+            attachments = report.attachments
         answer = truncate_to_token_budget(output.answer, parsed.max_tokens)
         finish_reason = "length" if answer != output.answer else "stop"
+        started_at = getattr(g, "request_started_at", None)
+        processing_ms = (time.perf_counter() - started_at) * 1000 if started_at is not None else None
+        stored_path = conversation_store.save(
+            request_id=getattr(g, "request_id", uuid.uuid4().hex),
+            parsed=parsed,
+            response_text=answer,
+            finish_reason=finish_reason,
+            title=output.title,
+            report_enabled=output.report_enabled,
+            attachments=attachments,
+            processing_ms=processing_ms,
+        )
+        if cfg.save_conversations and stored_path is None:
+            LOGGER.warning(
+                "Conversation persistence failed request_id=%s",
+                getattr(g, "request_id", "unknown"),
+            )
         if parsed.stream:
             response = Response(
                 stream_with_context(stream_response(
                     parsed.model,
                     parsed.prompt,
                     answer,
-                    report.attachments,
+                    attachments,
                     finish_reason,
                 )),
                 mimetype="text/event-stream",
@@ -160,7 +192,7 @@ def create_app(settings: Settings | None = None) -> Flask:
             parsed.model,
             parsed.prompt,
             answer,
-            report.attachments,
+            attachments,
             finish_reason,
         ))
 
@@ -173,7 +205,11 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.get("/files/<path:filename>")
     def files(filename: str) -> Any:
-        return send_from_directory(str(cfg.report_dir), filename, as_attachment=True)
+        return send_from_directory(
+            str(cfg.report_dir),
+            filename,
+            as_attachment=request.args.get("download") == "1",
+        )
 
     @app.errorhandler(Exception)
     def error_handler(exc: Exception) -> Any:

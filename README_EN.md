@@ -8,7 +8,7 @@ The project is positioned as research assistance, not investment advisory or aut
 
 - **Qingxiaoda integration**: `POST /v1/chat/completions` plus `x_soda.attachments` report artifacts.
 - **Stable A-share data layer**: Eastmoney quote/K-line APIs, CNInfo announcement search, optional akshare financial fields, cache, timeout, and graceful degradation.
-- **File analysis**: Parses user-uploaded `pdf/docx/xlsx/txt/md/csv/json` files from `file.url`.
+- **File and announcement analysis**: Parses user-uploaded `pdf/docx/xlsx/txt/md/csv/json` files and, for announcement requests, downloads recent CNINFO PDFs, extracts page-labelled text, and caches the bounded result.
 - **Multi-stock screening**: Scores a default A-share universe using momentum, trend, volatility control, volume activity, financial quality, and data availability.
 - **Backtest loop**: Uses an optional external backtest gateway; falls back to a local MA10/MA30 research simulation when unavailable.
 - **Chart reports**: Generates price trend charts, screening score charts, backtest equity charts, Markdown reports, and PDF reports.
@@ -50,6 +50,12 @@ public :8787 -> Nginx -> 127.0.0.1:18787 -> Gunicorn -> Flask
 
 After installing dependencies, validate the production entrypoint with:
 
+On Ubuntu/Debian, install an embeddable CJK font so generated PDFs render consistently in browsers and attachment previewers:
+
+```bash
+sudo apt-get install -y fonts-wqy-zenhei
+```
+
 ```bash
 PYTHONPATH=src gunicorn --config gunicorn.conf.py wsgi:app
 ```
@@ -82,6 +88,16 @@ The base URL may be a host root, a `/v1` URL, or the complete `/v1/chat/completi
 - Models: `GET /v1/models`
 - Auth: optional Bearer Token. If `QINGYAN_API_TOKEN` is set, configure the same token in the client.
 - Artifacts: responses include top-level `x_soda.attachments` with PDF, Markdown, and chart PNG files.
+- Image input: accepts OpenAI/Qingxiaoda `image_url` content parts. The server downloads public images and forwards them to the vision-capable upstream model for chart analysis.
+
+## A-share Coverage and Market-data Semantics
+
+- Security identity is resolved dynamically through CNINFO rather than being limited to the local demonstration universe.
+- SSE, SZSE, and BSE A-shares are supported. Legacy BSE `4/8` codes are normalized to current `920` codes when CNINFO provides the mapping.
+- Quotes use Tencent first, then Sina and Eastmoney as fallbacks, with an approximately 30-second short cache.
+- Daily bars use Tencent forward-adjusted data first. Sina unadjusted data is used when Tencent history is insufficient, including BSE cases, and the adjustment basis is exposed in the result. K-lines use an approximately 180-second cache.
+- An online quote snapshot is not a guaranteed zero-latency exchange feed. Closed markets return the latest trading-day snapshot, and source delay may exist during trading hours.
+- Stale validated cache is used only when online sources fail and is explicitly marked with `is_stale=true`.
 
 ## Environment Variables
 
@@ -93,11 +109,19 @@ The base URL may be a host root, a `/v1` URL, or the complete `/v1/chat/completi
 | `QINGYAN_PUBLIC_BASE_URL` | empty | Public URL for attachment links |
 | `QINGYAN_REPORT_DIR` | `outputs/reports` | Report output directory |
 | `QINGYAN_CACHE_DIR` | `outputs/cache` | Data cache directory |
+| `QINGYAN_CONVERSATION_DIR` | `outputs/conversations` | Local JSON archive for successful chats, grouped by date |
+| `QINGYAN_SAVE_CONVERSATIONS` | `true` | Persist successful chats locally without authorization headers or API keys |
+| `QINGYAN_CONVERSATION_MAX_CHARS` | `200000` | Maximum stored characters for one prompt or response |
 | `QINGYAN_MAX_REQUEST_BYTES` | `2097152` | Maximum API request body size |
 | `QINGYAN_MAX_DOWNLOAD_BYTES` | `26214400` | Maximum remote attachment size |
+| `QINGYAN_MAX_IMAGE_BYTES` | `10485760` | Maximum remote image size; PNG/JPEG/WebP/GIF are supported |
 | `QINGYAN_MAX_FILES_PER_REQUEST` | `5` | Maximum attachments per request |
 | `QINGYAN_REQUEST_TIMEOUT_SEC` | `12` | External data and attachment request timeout |
 | `QINGYAN_ANNOUNCEMENT_LOOKBACK_DAYS` | `180` | Announcement lookback window |
+| `QINGYAN_ANNOUNCEMENT_ATTACHMENT_MAX_FILES` | `3` | Maximum recent announcement PDFs extracted per request; set to `0` to disable |
+| `QINGYAN_ANNOUNCEMENT_ATTACHMENT_MAX_BYTES` | `8388608` | Maximum size of one announcement PDF |
+| `QINGYAN_ANNOUNCEMENT_ATTACHMENT_MAX_PAGES` | `20` | Maximum pages read from one announcement PDF |
+| `QINGYAN_ANNOUNCEMENT_ATTACHMENT_MAX_CHARS` | `9000` | Maximum extracted characters retained per announcement PDF |
 | `QINGYAN_ALLOW_PRIVATE_FILE_URLS` | `false` | Allow private-network attachment URLs; not recommended for public deployments |
 | `QINGYAN_TRUSTED_PROXY_COUNT` | `0` | Number of trusted reverse proxies; use `1` with the provided Nginx configuration |
 | `QINGYAN_CORS_ORIGINS` | `*` | Comma-separated allowed CORS origins |
@@ -111,6 +135,16 @@ The base URL may be a host root, a `/v1` URL, or the complete `/v1/chat/completi
 | `QINGYAN_LLM_MAX_INPUT_CHARS` | `60000` | Maximum evidence characters sent upstream |
 | `QINGYAN_LLM_TEMPERATURE` | `0.2` | Upstream generation temperature |
 | `QINGYAN_ENABLE_AKSHARE` | `false` | Enable optional akshare financial fields; disabled by default for faster demos |
+
+## Local Conversation Archive
+
+Successful Chat Completions are stored by default under:
+
+```text
+outputs/conversations/YYYY-MM-DD/HHMMSS_microseconds_request-id.json
+```
+
+Each JSON record contains the role-prefixed prompt, the response actually returned to the client, model and streaming metadata, finish reason, report title, and artifact file names. Authorization headers, server-configured API keys, and attachment URL query parameters are not stored. User-supplied message text is archived as conversation content, so users should not place passwords, keys, or other secrets in prompts. Conversation directories use mode `700`, JSON files use mode `600`, and the archive is not exposed by the `/files` route. Records do not expire automatically; deployments handling sensitive material should apply an explicit retention or deletion policy. Connection probes and rejected invalid requests are not archived.
 
 ## Demo Requests
 

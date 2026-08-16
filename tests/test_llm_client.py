@@ -65,6 +65,38 @@ def test_upstream_llm_openai_compatible_request(monkeypatch, tmp_path):
     assert captured["json"]["messages"][0]["role"] == "system"
 
 
+def test_upstream_llm_multimodal_request(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured.update(kwargs)
+        return FakeResponse({"choices": [{"message": {"content": "图片趋势已分析"}}]})
+
+    monkeypatch.setattr("qingyan_agent.llm_client.requests.post", fake_post)
+    settings = Settings(
+        report_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+        llm_base_url="https://gateway.example.com/v1",
+        llm_model="vision-model",
+    )
+    result = UpstreamLLMClient(settings).synthesize(
+        question="分析这张K线图",
+        intent="technical",
+        evidence={"images": [{"status": "ok"}]},
+        deterministic_draft="本地草稿",
+        image_data_urls=["data:image/png;base64,AAAA"],
+    )
+
+    assert result.used is True
+    content = captured["json"]["messages"][1]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"},
+    }
+
+
 def test_upstream_failure_returns_fallback_result(monkeypatch, tmp_path):
     def fail_post(*args, **kwargs):
         raise requests.Timeout("test timeout")

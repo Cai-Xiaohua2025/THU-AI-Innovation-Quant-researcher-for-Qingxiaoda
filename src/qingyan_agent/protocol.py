@@ -17,12 +17,19 @@ class InputFile:
 
 
 @dataclass
+class InputImage:
+    url: str = ""
+    detail: str = "auto"
+
+
+@dataclass
 class ParsedRequest:
     model: str
     stream: bool
     prompt: str
     max_tokens: int | None = None
     files: list[InputFile] = field(default_factory=list)
+    images: list[InputImage] = field(default_factory=list)
 
 
 def parse_request(payload: dict[str, Any]) -> ParsedRequest:
@@ -37,6 +44,7 @@ def parse_request(payload: dict[str, Any]) -> ParsedRequest:
 
     texts: list[str] = []
     files: list[InputFile] = []
+    images: list[InputImage] = []
     for message in messages:
         if not isinstance(message, dict):
             continue
@@ -61,9 +69,20 @@ def parse_request(payload: dict[str, Any]) -> ParsedRequest:
                         url=str(f.get("url") or ""),
                         file_id=str(f.get("file_id") or ""),
                     ))
+                elif part_type == "image_url":
+                    image = part.get("image_url") or {}
+                    if isinstance(image, str):
+                        image = {"url": image}
+                    if isinstance(image, dict):
+                        url = str(image.get("url") or "").strip()
+                        if url:
+                            detail = str(image.get("detail") or "auto").strip().lower()
+                            if detail not in {"auto", "low", "high"}:
+                                detail = "auto"
+                            images.append(InputImage(url=url, detail=detail))
     prompt = "\n".join(texts).strip()
-    if not prompt and not files:
-        raise ValueError("messages must contain text or a supported file part")
+    if not prompt and not files and not images:
+        raise ValueError("messages must contain text, image_url, or a supported file part")
 
     max_tokens = payload.get("max_completion_tokens", payload.get("max_tokens"))
     if max_tokens is not None:
@@ -85,6 +104,7 @@ def parse_request(payload: dict[str, Any]) -> ParsedRequest:
         prompt=prompt,
         max_tokens=max_tokens,
         files=files,
+        images=images,
     )
 
 

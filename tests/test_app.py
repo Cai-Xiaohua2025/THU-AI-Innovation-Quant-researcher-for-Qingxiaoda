@@ -9,6 +9,7 @@ def make_settings(tmp_path):
     return Settings(
         report_dir=tmp_path / "reports",
         cache_dir=tmp_path / "cache",
+        conversation_dir=tmp_path / "conversations",
         request_timeout_sec=1,
         api_token="",
         public_base_url="",
@@ -23,7 +24,10 @@ def test_health(tmp_path):
     client = app.test_client()
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.get_json()["openai_compatible"] is True
+    data = response.get_json()
+    assert data["openai_compatible"] is True
+    assert data["market_data_mode"] == "online_with_short_cache"
+    assert data["supported_a_share_markets"] == ["SSE", "SZSE", "BSE"]
 
 
 def test_relative_runtime_paths_resolve_from_project_root():
@@ -40,6 +44,7 @@ def test_chat_completion_single_stock(tmp_path):
     assert response.status_code == 200
     data = response.get_json()
     assert "合规提示" in data["choices"][0]["message"]["content"]
+    assert "继续分析宁德时代 300750：纯技术面版" in data["choices"][0]["message"]["content"]
     assert data["x_soda"]["attachments"]
 
 
@@ -55,7 +60,12 @@ def test_chat_completion_screening(tmp_path):
 
 
 def test_token_auth(tmp_path):
-    settings = Settings(report_dir=tmp_path / "reports", cache_dir=tmp_path / "cache", api_token="secret")
+    settings = Settings(
+        report_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+        conversation_dir=tmp_path / "conversations",
+        api_token="secret",
+    )
     app = create_app(settings)
     client = app.test_client()
     assert client.get("/v1/models").status_code == 401
@@ -76,6 +86,7 @@ def test_connection_probe_streaming(tmp_path):
     assert response.content_type.startswith("text/event-stream")
     assert '"object": "chat.completion.chunk"' in body
     assert body.endswith("data: [DONE]\n\n")
+    assert list((tmp_path / "conversations").glob("*/*.json")) == []
 
 
 def test_generated_attachments_are_downloadable(tmp_path):
@@ -83,7 +94,7 @@ def test_generated_attachments_are_downloadable(tmp_path):
     client = app.test_client()
     response = client.post("/v1/chat/completions", json={
         "model": "qingyan-liangce-agent",
-        "messages": [{"role": "user", "content": "请说明你的研究能力"}],
+        "messages": [{"role": "user", "content": "请分析宁德时代 300750 的走势和风险"}],
     })
     assert response.status_code == 200
     attachments = response.get_json()["x_soda"]["attachments"]
@@ -92,6 +103,61 @@ def test_generated_attachments_are_downloadable(tmp_path):
         file_response = client.get(attachment["fileUrl"])
         assert file_response.status_code == 200
         assert len(file_response.data) == attachment["fileSize"]
+        if attachment["fileType"] == "pdf":
+            assert file_response.content_type == "application/pdf"
+            assert "attachment" not in file_response.headers.get("Content-Disposition", "").lower()
+            download_response = client.get(attachment["fileUrl"] + "?download=1")
+            assert "attachment" in download_response.headers.get("Content-Disposition", "").lower()
+
+
+def test_greeting_explains_capabilities_without_report(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    client = app.test_client()
+    response = client.post("/v1/chat/completions", json={
+        "model": "qingyan-liangce-agent",
+        "messages": [{"role": "user", "content": "你好"}],
+    })
+    assert response.status_code == 200
+    data = response.get_json()
+    content = data["choices"][0]["message"]["content"]
+    assert "单股走势研究" in content
+    assert "公告与事件解读" in content
+    assert "策略回测" in content
+    assert "分析长江电力 600900" in content
+    assert data["x_soda"]["attachments"] == []
+
+
+def test_successful_chat_is_saved_to_local_conversation_folder(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    response = app.test_client().post("/v1/chat/completions", json={
+        "model": "qingyan-liangce-agent",
+        "messages": [{"role": "user", "content": "你好"}],
+    })
+    assert response.status_code == 200
+    stored = list((tmp_path / "conversations").glob("*/*.json"))
+    assert len(stored) == 1
+    import json
+    record = json.loads(stored[0].read_text(encoding="utf-8"))
+    assert record["request"]["prompt"] == "user: 你好"
+    assert "单股走势研究" in record["response"]["content"]
+    assert record["response"]["report_enabled"] is False
+
+
+def test_successful_streaming_chat_is_saved_to_local_conversation_folder(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    response = app.test_client().post("/v1/chat/completions", json={
+        "model": "qingyan-liangce-agent",
+        "stream": True,
+        "messages": [{"role": "user", "content": "你好"}],
+    })
+    assert response.status_code == 200
+    assert response.get_data(as_text=True).endswith("data: [DONE]\n\n")
+    stored = list((tmp_path / "conversations").glob("*/*.json"))
+    assert len(stored) == 1
+    import json
+    record = json.loads(stored[0].read_text(encoding="utf-8"))
+    assert record["request"]["stream"] is True
+    assert "单股走势研究" in record["response"]["content"]
 
 
 def test_configured_upstream_llm_is_used(monkeypatch, tmp_path):
@@ -128,7 +194,7 @@ def test_configured_upstream_llm_is_used(monkeypatch, tmp_path):
 
     response = client.post("/v1/chat/completions", json={
         "model": "qingyan-liangce-agent",
-        "messages": [{"role": "user", "content": "请说明你的研究能力"}],
+        "messages": [{"role": "user", "content": "请分析宁德时代 300750 的走势和风险"}],
     })
     assert response.status_code == 200
     content = response.get_json()["choices"][0]["message"]["content"]
@@ -152,9 +218,9 @@ def test_upstream_llm_failure_keeps_deterministic_answer(monkeypatch, tmp_path):
     client = app.test_client()
     response = client.post("/v1/chat/completions", json={
         "model": "qingyan-liangce-agent",
-        "messages": [{"role": "user", "content": "请说明你的研究能力"}],
+        "messages": [{"role": "user", "content": "请分析宁德时代 300750 的走势和风险"}],
     })
     assert response.status_code == 200
     content = response.get_json()["choices"][0]["message"]["content"]
-    assert "暂未识别到明确 A 股标的" in content
+    assert "研究对象：宁德时代" in content
     assert "合规提示" in content

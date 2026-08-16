@@ -13,6 +13,7 @@ class Target:
     name: str = ""
     sector: str = ""
     confidence: int = 50
+    org_id: str = ""
 
 
 @dataclass
@@ -54,3 +55,4 @@ class ResearchOutput:
     answer: str
     report_markdown: str
     attachments: list[dict[str, Any]] = field(default_factory=list)
+    report_enabled: bool = True
