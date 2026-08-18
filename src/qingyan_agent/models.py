@@ -5,6 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .contracts import (
+    AnnouncementRecord,
+    Artifact,
+    DataErrorKind,
+    FundamentalData,
+    KlineBar,
+    QuoteData,
+    ResearchContext,
+    TechnicalIndicators,
+)
+
 
 @dataclass(frozen=True)
 class Target:
@@ -21,16 +32,17 @@ class DataStatus:
     source: str
     ok: bool
     message: str = ""
+    error_kind: DataErrorKind | None = None
 
 
 @dataclass
 class MarketSnapshot:
     target: Target | None
-    quote: dict[str, Any] = field(default_factory=dict)
-    klines: list[dict[str, Any]] = field(default_factory=list)
-    technical: dict[str, Any] = field(default_factory=dict)
-    fundamentals: dict[str, Any] = field(default_factory=dict)
-    announcements: list[dict[str, Any]] = field(default_factory=list)
+    quote: QuoteData = field(default_factory=dict)
+    klines: list[KlineBar] = field(default_factory=list)
+    technical: TechnicalIndicators = field(default_factory=dict)
+    fundamentals: FundamentalData = field(default_factory=dict)
+    announcements: list[AnnouncementRecord] = field(default_factory=list)
     statuses: list[DataStatus] = field(default_factory=list)
 
 
@@ -54,5 +66,6 @@ class ResearchOutput:
     title: str
     answer: str
     report_markdown: str
-    attachments: list[dict[str, Any]] = field(default_factory=list)
+    attachments: list[Artifact] = field(default_factory=list)
     report_enabled: bool = True
+    context: ResearchContext | None = None

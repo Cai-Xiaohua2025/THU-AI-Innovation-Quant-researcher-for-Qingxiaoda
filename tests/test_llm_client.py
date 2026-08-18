@@ -1,7 +1,16 @@
 import requests
 
 from qingyan_agent.config import Settings
-from qingyan_agent.llm_client import UpstreamLLMClient, extract_message_content, normalize_chat_completions_url
+from qingyan_agent.contracts import AnswerProfile
+from qingyan_agent.llm_client import (
+    UpstreamLLMClient,
+    answer_respects_profile,
+    build_synthesis_input,
+    deduplicate_repeated_blocks,
+    extract_message_content,
+    normalize_chat_completions_url,
+    sanitize_evidence_for_llm,
+)
 
 
 class FakeResponse:
@@ -175,3 +184,67 @@ def test_retries_with_max_completion_tokens_for_modern_models(monkeypatch, tmp_p
     assert "max_tokens" not in payloads[1]
     assert "temperature" not in payloads[1]
     assert payloads[1]["max_completion_tokens"] == settings.llm_max_tokens
+
+
+def test_synthesis_input_carries_announcement_source_text_only_once():
+    raw = "[第1页]\n唯一公告原文标记-XYZ"
+    evidence = {
+        "announcements": [{
+            "symbol": "600900",
+            "title": "测试公告",
+            "date": "2026-08-01",
+            "attachment": {"status": "ok", "text": raw},
+        }],
+        "announcement_analysis": [{
+            "title": "测试公告",
+            "facts": ["结构化事实"],
+        }],
+    }
+
+    content = build_synthesis_input(
+        question="看看公告",
+        intent="announcement",
+        evidence=evidence,
+        deterministic_draft="标准草稿只包含结构化事实，不包含原文标记。",
+        max_chars=12000,
+    )
+    sanitized, excerpts = sanitize_evidence_for_llm(evidence)
+
+    assert content.count("唯一公告原文标记-XYZ") == 1
+    assert "source_excerpts" in content
+    assert sanitized["announcements"][0]["attachment"]["text_available"] is True
+    assert "text" not in sanitized["announcements"][0]["attachment"]
+    assert excerpts[0]["title"] == "测试公告"
+
+
+def test_synthesis_input_preserves_final_instruction_under_budget_pressure():
+    content = build_synthesis_input(
+        question="问题" * 1000,
+        intent="full_research",
+        evidence={"large": "证据" * 10000},
+        deterministic_draft="草稿" * 10000,
+        max_chars=5000,
+    )
+
+    assert len(content) <= 5000
+    assert content.endswith("必须区分公告事实、分析推断、潜在影响和待验证事项。")
+
+
+def test_final_answer_deduplicates_repeated_long_paragraphs_only():
+    duplicate = "这是一段重复的公告正文证据。" * 12
+    content = f"## 公告证据\n\n{duplicate}\n\n## 其他部分\n\n{duplicate}\n\n短句\n\n短句"
+
+    result = deduplicate_repeated_blocks(content)
+
+    assert result.count(duplicate) == 1
+    assert result.count("短句") == 2
+
+
+def test_chat_answer_profile_rejects_report_only_announcement_source_text():
+    safe = "## 重要公告解读\n- 公司披露年度分红安排。\n- [查看原文](https://example.com/a.pdf)"
+    raw = "## 公告附件正文证据\n[第1页]\n证券代码：600900\n" + "公告原文" * 200
+
+    assert answer_respects_profile(safe, AnswerProfile.CONCISE) is True
+    assert answer_respects_profile(raw, AnswerProfile.STANDARD) is False
+    assert answer_respects_profile("正常分析" * 1500, AnswerProfile.STANDARD) is False
+    assert answer_respects_profile(raw, AnswerProfile.DETAILED) is True

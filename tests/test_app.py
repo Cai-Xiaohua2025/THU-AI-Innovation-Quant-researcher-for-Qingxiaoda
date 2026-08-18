@@ -1,5 +1,4 @@
 from dataclasses import replace
-from pathlib import Path
 
 from qingyan_agent.app import create_app
 from qingyan_agent.config import PROJECT_ROOT, Settings, project_path
@@ -28,6 +27,24 @@ def test_health(tmp_path):
     assert data["openai_compatible"] is True
     assert data["market_data_mode"] == "online_with_short_cache"
     assert data["supported_a_share_markets"] == ["SSE", "SZSE", "BSE"]
+    assert data["streaming_mode"] == "progress_sse_buffered_content"
+    assert data["research_progress_events"] is True
+    assert data["upstream_token_passthrough"] is False
+    assert data["file_auth_required"] is False
+    assert data["artifact_signing_ready"] is True
+
+
+def test_ready_rejects_enabled_artifact_signing_without_a_key(tmp_path):
+    settings = replace(
+        make_settings(tmp_path),
+        sign_artifact_urls=True,
+        artifact_signing_key="",
+        api_token="",
+    )
+    response = create_app(settings).test_client().get("/ready")
+
+    assert response.status_code == 503
+    assert response.get_json()["checks"]["artifact_signing"] is False
 
 
 def test_relative_runtime_paths_resolve_from_project_root():
@@ -44,7 +61,12 @@ def test_chat_completion_single_stock(tmp_path):
     assert response.status_code == 200
     data = response.get_json()
     assert "合规提示" in data["choices"][0]["message"]["content"]
-    assert "继续分析宁德时代 300750：纯技术面版" in data["choices"][0]["message"]["content"]
+    assert "市场快照与核心指标" in data["choices"][0]["message"]["content"]
+    assert "关键价位与情景推演" in data["choices"][0]["message"]["content"]
+    assert "数据质量与方法说明" in data["choices"][0]["message"]["content"]
+    assert "## 接下来可以继续" in data["choices"][0]["message"]["content"]
+    assert "宁德时代 300750" in data["choices"][0]["message"]["content"]
+    assert "近期公告" in data["choices"][0]["message"]["content"]
     assert data["x_soda"]["attachments"]
 
 
@@ -97,8 +119,13 @@ def test_generated_attachments_are_downloadable(tmp_path):
         "messages": [{"role": "user", "content": "请分析宁德时代 300750 的走势和风险"}],
     })
     assert response.status_code == 200
-    attachments = response.get_json()["x_soda"]["attachments"]
+    payload = response.get_json()
+    attachments = payload["x_soda"]["attachments"]
     assert attachments
+    answer = payload["choices"][0]["message"]["content"]
+    pdf_attachment = next(item for item in attachments if item["mimeType"] == "application/pdf")
+    assert "下载 PDF 研报" in answer
+    assert pdf_attachment["fileUrl"] in answer
     for attachment in attachments:
         file_response = client.get(attachment["fileUrl"])
         assert file_response.status_code == 200
@@ -108,6 +135,28 @@ def test_generated_attachments_are_downloadable(tmp_path):
             assert "attachment" not in file_response.headers.get("Content-Disposition", "").lower()
             download_response = client.get(attachment["fileUrl"] + "?download=1")
             assert "attachment" in download_response.headers.get("Content-Disposition", "").lower()
+
+
+def test_file_download_can_optionally_require_bearer_auth(tmp_path):
+    settings = replace(
+        make_settings(tmp_path),
+        api_token="secret",
+        require_file_auth=True,
+    )
+    client = create_app(settings).test_client()
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer secret"},
+        json={
+            "model": "qingyan-liangce-agent",
+            "messages": [{"role": "user", "content": "请分析宁德时代 300750 的走势"}],
+        },
+    )
+    attachment_url = response.get_json()["x_soda"]["attachments"][0]["fileUrl"]
+
+    assert client.get(attachment_url).status_code == 401
+    assert client.get(attachment_url, headers={"Authorization": "Bearer secret"}).status_code == 200
+
 
 
 def test_greeting_explains_capabilities_without_report(tmp_path):
@@ -160,6 +209,28 @@ def test_successful_streaming_chat_is_saved_to_local_conversation_folder(tmp_pat
     assert "单股走势研究" in record["response"]["content"]
 
 
+def test_streaming_chat_establishes_sse_before_research_and_emits_progress(tmp_path):
+    app = create_app(make_settings(tmp_path))
+    response = app.test_client().post("/v1/chat/completions", buffered=False, json={
+        "model": "qingyan-liangce-agent",
+        "stream": True,
+        "messages": [{"role": "user", "content": "你好"}],
+    })
+    iterator = iter(response.response)
+    first = next(iterator).decode("utf-8")
+
+    assert response.status_code == 200
+    assert '"stage": "accepted"' in first
+    assert list((tmp_path / "conversations").glob("*/*.json")) == []
+
+    body = first + "".join(chunk.decode("utf-8") for chunk in iterator)
+    assert '"stage": "reading_attachments"' in body
+    assert '"stage": "researching"' in body
+    assert '"stage": "completed"' in body
+    assert body.endswith("data: [DONE]\n\n")
+    assert len(list((tmp_path / "conversations").glob("*/*.json"))) == 1
+
+
 def test_configured_upstream_llm_is_used(monkeypatch, tmp_path):
     class Response:
         status_code = 200
@@ -190,6 +261,8 @@ def test_configured_upstream_llm_is_used(monkeypatch, tmp_path):
 
     health = client.get("/health").get_json()
     assert health["upstream_llm_configured"] is True
+    assert health["fundamentals_enabled"] is False
+    assert health["fundamentals_provider"] == "disabled"
     assert health["upstream_llm_model"] == "example-model"
 
     response = client.post("/v1/chat/completions", json={

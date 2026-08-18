@@ -3,7 +3,7 @@ from __future__ import annotations
 from pypdf import PdfReader
 
 from qingyan_agent.config import Settings
-from qingyan_agent.reporting import ChartService, prepare_pdf_markdown, sparse_tick_positions, write_pdf
+from qingyan_agent.reporting import ChartService, moving_average, prepare_pdf_markdown, sparse_tick_positions, write_pdf
 
 
 def test_sparse_tick_positions_keep_endpoints_and_limit_density():
@@ -12,6 +12,10 @@ def test_sparse_tick_positions_keep_endpoints_and_limit_density():
     assert positions[-1] == 89
     assert len(positions) == 8
     assert positions == sorted(set(positions))
+
+
+def test_moving_average_keeps_series_alignment():
+    assert moving_average([1, 2, 3, 4], 3) == [None, None, 2.0, 3.0]
 
 
 def test_price_chart_with_many_rows_renders_sparse_date_axis(tmp_path, monkeypatch):
@@ -94,3 +98,4 @@ def test_write_pdf_renders_chinese_markdown(tmp_path):
     assert "**" not in text
     assert reader.metadata.title == "清研量策测试报告"
     assert reader.metadata.author == "清研量策"
+    assert "清研量策·A股研究助手" in text

@@ -19,13 +19,22 @@ except Exception:
     CORS = None
 
 from .backtest import BacktestService
+from .artifacts import ArtifactRegistry
 from .config import Settings, load_settings
 from .conversation_store import ConversationStore
 from .data_sources import AShareDataClient
 from .file_reader import FileReader
 from .llm_client import UpstreamLLMClient
-from .protocol import completion_response, parse_request, stream_response, truncate_to_token_budget
+from .protocol import (
+    append_artifact_links,
+    completion_response,
+    parse_request,
+    progress_event,
+    stream_response,
+    truncate_to_token_budget,
+)
 from .reporting import ChartService, ReportService
+from .retention import RetentionManager
 from .research_agent import ResearchAgent
 from .screening import StockScreener
 
@@ -58,6 +67,8 @@ def create_app(settings: Settings | None = None) -> Flask:
     agent = ResearchAgent(data_client, screener, backtester, charts, llm_client)
     reader = FileReader(cfg)
     conversation_store = ConversationStore(cfg)
+    artifact_registry = ArtifactRegistry(cfg)
+    RetentionManager(cfg).apply()
 
     @app.before_request
     def start_request() -> None:
@@ -88,13 +99,29 @@ def create_app(settings: Settings | None = None) -> Flask:
             "service": "qingyan-liangce-agent",
             "openai_compatible": True,
             "qingxiaoda_attachments": True,
+            "streaming_mode": "progress_sse_buffered_content",
+            "research_progress_events": True,
+            "upstream_token_passthrough": False,
             "vision_image_url": True,
             "market_data_mode": "online_with_short_cache",
             "supported_a_share_markets": ["SSE", "SZSE", "BSE"],
             "market_quote_sources": ["tencent", "sina", "eastmoney"],
+            "fundamentals_enabled": cfg.enable_akshare,
+            "fundamentals_provider": "akshare" if cfg.enable_akshare else "disabled",
             "announcement_attachment_extraction": True,
             "announcement_attachment_max_files": cfg.announcement_attachment_max_files,
             "conversation_storage_enabled": cfg.save_conversations,
+            "retention_days": {
+                "cache": cfg.cache_retention_days,
+                "reports": cfg.report_retention_days,
+                "conversations": cfg.conversation_retention_days,
+            },
+            "file_auth_required": cfg.require_file_auth,
+            "signed_artifact_urls": cfg.sign_artifact_urls,
+            "artifact_signing_ready": (
+                not cfg.sign_artifact_urls
+                or bool(cfg.artifact_signing_key or cfg.api_token)
+            ),
             "upstream_llm_configured": cfg.llm_configured,
             "upstream_llm_model": cfg.llm_model if cfg.llm_configured else "",
             "live_trading_enabled": cfg.live_trading_enabled,
@@ -108,6 +135,8 @@ def create_app(settings: Settings | None = None) -> Flask:
         }
         if cfg.save_conversations:
             checks["conversation_dir"] = conversation_store.ensure_ready()
+        if cfg.sign_artifact_urls:
+            checks["artifact_signing"] = bool(cfg.artifact_signing_key or cfg.api_token)
         is_ready = all(checks.values())
         return jsonify({"status": "ready" if is_ready else "not_ready", "checks": checks}), 200 if is_ready else 503
 
@@ -150,15 +179,113 @@ def create_app(settings: Settings | None = None) -> Flask:
                 "invalid_request_error",
                 400,
             )
+        if parsed.stream:
+            request_id = getattr(g, "request_id", uuid.uuid4().hex)
+            started_at = getattr(g, "request_started_at", None)
+            base_url = request.url_root.rstrip("/")
+
+            def generate_stream():
+                chat_id = f"chatcmpl-{uuid.uuid4().hex}"
+                created = int(time.time())
+                try:
+                    yield progress_event(
+                        parsed.model, "accepted", "研究请求已接受",
+                        chat_id=chat_id, created=created,
+                    )
+                    yield progress_event(
+                        parsed.model, "reading_attachments", "正在安全读取附件和图片",
+                        chat_id=chat_id, created=created,
+                    )
+                    files = reader.read_all(parsed.files)
+                    images = reader.read_images(parsed.images)
+                    yield progress_event(
+                        parsed.model, "researching", "正在识别标的、收集证据并执行确定性分析",
+                        chat_id=chat_id, created=created,
+                    )
+                    output, chart_paths = agent.run(parsed.prompt, files, images)
+                    attachments = output.attachments
+                    if output.report_enabled:
+                        yield progress_event(
+                            parsed.model, "generating_artifacts", "正在生成报告和图表附件",
+                            chat_id=chat_id, created=created,
+                        )
+                        report = ReportService(cfg, base_url, artifact_registry).create(
+                            output.title,
+                            output.report_markdown,
+                            chart_paths,
+                        )
+                        attachments = report.attachments
+                    answer = truncate_to_token_budget(output.answer, parsed.max_tokens)
+                    finish_reason = "length" if answer != output.answer else "stop"
+                    answer = append_artifact_links(answer, attachments)
+                    processing_ms = (
+                        (time.perf_counter() - started_at) * 1000
+                        if started_at is not None else None
+                    )
+                    stored_path = conversation_store.save(
+                        request_id=request_id,
+                        parsed=parsed,
+                        response_text=answer,
+                        finish_reason=finish_reason,
+                        title=output.title,
+                        report_enabled=output.report_enabled,
+                        attachments=attachments,
+                        processing_ms=processing_ms,
+                    )
+                    if cfg.save_conversations and stored_path is None:
+                        LOGGER.warning("Conversation persistence failed request_id=%s", request_id)
+                    yield progress_event(
+                        parsed.model, "completed", "研究完成，开始返回正文",
+                        chat_id=chat_id, created=created,
+                    )
+                    yield from stream_response(
+                        parsed.model,
+                        parsed.prompt,
+                        answer,
+                        attachments,
+                        finish_reason,
+                        chat_id=chat_id,
+                        created=created,
+                    )
+                except Exception:
+                    LOGGER.exception("Streaming research failed request_id=%s", request_id)
+                    yield progress_event(
+                        parsed.model,
+                        "failed",
+                        "研究执行失败，未返回未经核验的结果",
+                        chat_id=chat_id,
+                        created=created,
+                        event="error",
+                    )
+                    yield from stream_response(
+                        parsed.model,
+                        parsed.prompt,
+                        "研究执行失败，请稍后重试。",
+                        finish_reason="stop",
+                        chat_id=chat_id,
+                        created=created,
+                    )
+
+            response = Response(
+                stream_with_context(generate_stream()),
+                mimetype="text/event-stream",
+            )
+            return configure_stream_response(response)
+
         files = reader.read_all(parsed.files)
         images = reader.read_images(parsed.images)
         output, chart_paths = agent.run(parsed.prompt, files, images)
         attachments = output.attachments
         if output.report_enabled:
-            report = ReportService(cfg, request.url_root.rstrip("/")).create(output.title, output.report_markdown, chart_paths)
+            report = ReportService(
+                cfg,
+                request.url_root.rstrip("/"),
+                artifact_registry,
+            ).create(output.title, output.report_markdown, chart_paths)
             attachments = report.attachments
         answer = truncate_to_token_budget(output.answer, parsed.max_tokens)
         finish_reason = "length" if answer != output.answer else "stop"
+        answer = append_artifact_links(answer, attachments)
         started_at = getattr(g, "request_started_at", None)
         processing_ms = (time.perf_counter() - started_at) * 1000 if started_at is not None else None
         stored_path = conversation_store.save(
@@ -176,18 +303,6 @@ def create_app(settings: Settings | None = None) -> Flask:
                 "Conversation persistence failed request_id=%s",
                 getattr(g, "request_id", "unknown"),
             )
-        if parsed.stream:
-            response = Response(
-                stream_with_context(stream_response(
-                    parsed.model,
-                    parsed.prompt,
-                    answer,
-                    attachments,
-                    finish_reason,
-                )),
-                mimetype="text/event-stream",
-            )
-            return configure_stream_response(response)
         return jsonify(completion_response(
             parsed.model,
             parsed.prompt,
@@ -205,10 +320,34 @@ def create_app(settings: Settings | None = None) -> Flask:
 
     @app.get("/files/<path:filename>")
     def files(filename: str) -> Any:
+        if cfg.require_file_auth and not authorized(cfg):
+            return unauthorized()
         return send_from_directory(
             str(cfg.report_dir),
             filename,
             as_attachment=request.args.get("download") == "1",
+        )
+
+    @app.get("/artifacts/<artifact_id>")
+    def artifacts(artifact_id: str) -> Any:
+        record, status = artifact_registry.resolve(
+            artifact_id,
+            request.args.get("expires", ""),
+            request.args.get("signature", ""),
+        )
+        if status == "expired":
+            return api_error("Artifact URL has expired", "artifact_expired", 403)
+        if status == "invalid_signature":
+            return api_error("Invalid artifact signature", "authentication_error", 403)
+        if not record:
+            return api_error("Artifact not found", "not_found", 404)
+        if cfg.require_file_auth and not authorized(cfg):
+            return unauthorized()
+        return send_from_directory(
+            str(cfg.report_dir),
+            str(record["filename"]),
+            as_attachment=request.args.get("download") == "1",
+            mimetype=str(record.get("mime_type") or "application/octet-stream"),
         )
 
     @app.errorhandler(Exception)

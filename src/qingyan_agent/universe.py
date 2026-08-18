@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from .models import Target
 
@@ -10,6 +11,18 @@ from .models import Target
 A_SHARE_CODE_RE = re.compile(
     r"(?<!\d)(60[0135]\d{3}|68[89]\d{3}|00[0123]\d{3}|30[01]\d{3}|920\d{3}|[48]\d{5})(?!\d)"
 )
+ANY_SIX_DIGIT_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+
+@dataclass(frozen=True)
+class SecurityReference:
+    raw_codes: tuple[str, ...] = ()
+    valid_codes: tuple[str, ...] = ()
+    name_queries: tuple[str, ...] = ()
+
+    @property
+    def explicit(self) -> bool:
+        return bool(self.raw_codes or self.name_queries)
 
 
 DEFAULT_A_SHARE_UNIVERSE: list[Target] = [
@@ -71,6 +84,22 @@ GREETING_PHRASES = (
 )
 
 SECURITY_QUERY_PREFIXES = (
+    "继续分析一下",
+    "继续分析",
+    "继续看看",
+    "继续看",
+    "再分析一下",
+    "再分析",
+    "再看看",
+    "再看",
+    "接着分析",
+    "接着看",
+    "换成",
+    "换为",
+    "改成",
+    "改看",
+    "改为",
+    "将",
     "能不能帮我看看",
     "能不能看看",
     "能否帮我看看",
@@ -358,7 +387,30 @@ SECURITY_QUERY_STOPWORDS = {
     "老师",
     "同学",
     "老师你好",
+    "继续分析",
+    "再详细一点",
+    "注明数据日期",
+    "数据日期",
+    "均线结构",
+    "量能变化",
+    "趋势判断和",
+    "趋势判断",
+    "主要风险",
+    "这个",
 }
+
+NON_SECURITY_QUERY_PREFIXES = (
+    "注明",
+    "数据日期",
+    "均线",
+    "量能",
+    "趋势判断",
+    "主要风险",
+    "风险提示",
+    "详细",
+    "继续分析",
+    "这个",
+)
 
 
 def infer_target(prompt: str) -> Target | None:
@@ -366,19 +418,38 @@ def infer_target(prompt: str) -> Target | None:
     # the latest turn is a short follow-up such as "1" or "继续分析公告".
     # Assistant messages are deliberately excluded so model text cannot silently
     # replace the user's chosen security.
-    for text in reversed(user_turn_texts(prompt)):
-        lower = text.lower()
-        for alias, target in ALIASES.items():
-            if alias.lower() in lower:
-                return target
-        code_match = A_SHARE_CODE_RE.search(text)
-        if code_match:
-            code = code_match.group(1)
-            for item in DEFAULT_A_SHARE_UNIVERSE:
-                if item.symbol == code:
-                    return item
-            return Target("CNStock", code, confidence=78)
+    turns = user_turn_texts(prompt)
+    if not turns:
+        return None
+    latest = turns[-1]
+    current = explicit_target_from_text(latest)
+    if current:
+        return current
+    # A new company name or even a mistyped six-digit code is an explicit
+    # switch signal. Do not silently inherit the previous security in that case;
+    # the provider must resolve and validate the latest name/code combination.
+    if parse_security_reference(latest).explicit:
+        return None
+    for text in reversed(turns[:-1]):
+        inherited = explicit_target_from_text(text)
+        if inherited:
+            return inherited
     return None
+
+
+def explicit_target_from_text(text: str) -> Target | None:
+    lower = str(text or "").lower()
+    for alias, target in ALIASES.items():
+        if alias.lower() in lower:
+            return target
+    code_match = A_SHARE_CODE_RE.search(text or "")
+    if not code_match:
+        return None
+    code = code_match.group(1)
+    for item in DEFAULT_A_SHARE_UNIVERSE:
+        if item.symbol == code:
+            return item
+    return Target("CNStock", code, confidence=78)
 
 
 def infer_intent(prompt: str) -> str:
@@ -405,26 +476,31 @@ def explicit_intent(text: str, *, allow_greeting: bool) -> str | None:
         return "screening"
     if any(word in value for word in ("回测", "策略", "因子", "收益", "回撤", "胜率", "backtest")):
         return "backtest"
-    if any(word in value for word in (
+    fundamental_terms = (
         "财报", "年报", "季报", "利润", "现金流", "roe", "pe", "pb", "基本面",
         "业绩", "营收", "盈利", "毛利", "负债", "估值", "经营情况", "经营表现",
-    )):
-        return "fundamental"
-    if any(word in value for word in (
-        "技术面 + 公告", "技术面+公告", "技术面和公告", "技术面与公告",
-        "走势和公告", "走势与公告", "综合分析", "全面分析",
-    )):
-        return "full_research"
-    if any(word in value for word in (
-        "公告", "新闻", "消息", "政策", "归因", "为什么", "为何", "异动", "催化", "事件驱动",
+    )
+    announcement_terms = (
+        "公告", "新闻", "消息", "政策", "归因", "为什么", "为何", "异动", "催化", "事件", "事件驱动",
         "咋回事",
-    )):
-        return "announcement"
-    if any(word in value for word in (
+    )
+    technical_terms = (
         "走势", "k线", "均线", "rsi", "macd", "趋势", "技术", "股价", "行情", "表现",
         "涨跌", "强弱", "后市", "短线", "中线", "支撑", "压力", "量价", "怎么看", "咋样",
         "什么情况", "走得怎么样",
-    )):
+    )
+    topic_hits = sum((
+        any(word in value for word in fundamental_terms),
+        any(word in value for word in announcement_terms),
+        any(word in value for word in technical_terms),
+    ))
+    if topic_hits >= 2 or any(word in value for word in ("综合分析", "全面分析", "综合研究")):
+        return "full_research"
+    if any(word in value for word in fundamental_terms):
+        return "fundamental"
+    if any(word in value for word in announcement_terms):
+        return "announcement"
+    if any(word in value for word in technical_terms):
         return "technical"
     return None
 
@@ -467,6 +543,61 @@ def latest_user_text(prompt: str) -> str:
     return turns[-1] if turns else (prompt or "").strip()
 
 
+def effective_user_text(prompt: str) -> str:
+    """Expand numeric follow-up choices without consulting assistant messages."""
+    latest = latest_user_text(prompt)
+    cleaned = re.sub(r"[*_`#]", "", latest).strip().lower()
+    if re.match(r"^(?:选\s*)?1(?:\s|[.、，,:：)）]|$)", cleaned) or cleaned.startswith(("第一种", "第一个")):
+        return latest + "；纯技术面版"
+    if re.match(r"^(?:选\s*)?2(?:\s|[.、，,:：)）]|$)", cleaned) or cleaned.startswith(("第二种", "第二个")):
+        return latest + "；技术面 + 公告事件版"
+    if re.match(r"^(?:选\s*)?3(?:\s|[.、，,:：)）]|$)", cleaned) or cleaned.startswith(("第三种", "第三个")):
+        return latest + "；综合研究投研纪要简版"
+    return latest
+
+
+def parse_security_reference(text: str) -> SecurityReference:
+    """Extract an explicit security switch from one user turn."""
+    value = str(text or "").strip()
+    raw_codes = tuple(dict.fromkeys(ANY_SIX_DIGIT_CODE_RE.findall(value)))
+    valid_codes = tuple(code for code in raw_codes if is_a_share_code(code))
+    names: list[str] = []
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,40}", value):
+        candidate = normalize_security_candidate(chunk)
+        if is_probable_security_name(candidate) and candidate not in names:
+            names.append(candidate)
+    return SecurityReference(raw_codes, valid_codes, tuple(names))
+
+
+def target_resolution_notes(question: str, target: Target | None) -> list[str]:
+    """Describe deterministic code correction/conflict outcomes to the user."""
+    reference = parse_security_reference(question)
+    if not reference.raw_codes:
+        return []
+    invalid_codes = [code for code in reference.raw_codes if code not in reference.valid_codes]
+    if invalid_codes and target:
+        return [
+            f"输入代码 {invalid_codes[0]} 不是有效的公开 A 股代码；"
+            f"已按公司名称核验为{target.name or target.symbol}（{target.symbol}）。"
+        ]
+    if invalid_codes and not target:
+        return [
+            f"输入代码 {invalid_codes[0]} 不是有效的公开 A 股代码，"
+            "且当前公司名称未完成证券身份核验；本次未沿用历史证券数据。"
+        ]
+    if reference.valid_codes and target and target.symbol not in reference.valid_codes:
+        return [
+            "当前输入中的公司名称与证券代码未核验为同一证券；"
+            "为避免分析错标的，本次不继承上一轮股票。"
+        ]
+    if reference.valid_codes and not target and reference.name_queries:
+        return [
+            "当前输入中的公司名称与证券代码可能不一致；"
+            "为避免分析错标的，本次未沿用历史证券数据。"
+        ]
+    return []
+
+
 def is_greeting_prompt(prompt: str) -> bool:
     value = re.sub(r"[\s，。！？!?、,.]+", "", latest_user_text(prompt)).lower()
     if value in GREETING_EXACT:
@@ -479,13 +610,21 @@ def is_greeting_prompt(prompt: str) -> bool:
 def security_search_queries(prompt: str, target: Target | None = None) -> list[str]:
     """Build conservative CNINFO lookup terms from a natural-language request."""
     queries: list[str] = []
+    turns = user_turn_texts(prompt)
+    latest = turns[-1] if turns else str(prompt or "")
+    latest_reference = parse_security_reference(latest)
+    if latest_reference.explicit:
+        queries.extend(latest_reference.valid_codes)
+        queries.extend(latest_reference.name_queries)
+        return list(dict.fromkeys(query.strip() for query in queries if query.strip()))
+
     if target:
         if target.symbol:
             queries.append(target.symbol)
         if target.name:
             queries.append(target.name)
 
-    for text in reversed(user_turn_texts(prompt)):
+    for text in reversed(turns):
         if followup_choice_intent(text):
             continue
         code_match = A_SHARE_CODE_RE.search(text)
@@ -503,6 +642,17 @@ def security_search_queries(prompt: str, target: Target | None = None) -> list[s
         if value and value not in deduplicated:
             deduplicated.append(value)
     return deduplicated
+
+
+def is_probable_security_name(value: str) -> bool:
+    candidate = str(value or "").strip()
+    if not 2 <= len(candidate) <= 16 or candidate in SECURITY_QUERY_STOPWORDS:
+        return False
+    if candidate.startswith(NON_SECURITY_QUERY_PREFIXES):
+        return False
+    if candidate in SECURITY_TOPIC_MARKERS or candidate in SECURITY_QUERY_SUFFIXES:
+        return False
+    return True
 
 
 def normalize_security_candidate(value: str) -> str:

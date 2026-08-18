@@ -1,0 +1,3 @@
+# Optional richer A-share fundamentals. The service works without this package.
+akshare>=1.12.0
+

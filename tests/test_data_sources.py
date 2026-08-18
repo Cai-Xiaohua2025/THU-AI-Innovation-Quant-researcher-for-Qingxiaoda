@@ -1,17 +1,28 @@
 from __future__ import annotations
 
-from datetime import datetime
+from threading import Barrier
 
 import pytest
 
 from qingyan_agent.config import Settings
-from qingyan_agent.data_sources import AShareDataClient, cninfo_market_params, tencent_market_symbol
+from qingyan_agent.data_sources import (
+    AShareDataClient,
+    annotate_intraday_bar,
+    cninfo_market_params,
+    technical_indicators,
+    tencent_market_symbol,
+)
+from qingyan_agent.deterministic_analysis import resolve_answer_profile
+from qingyan_agent.contracts import AnswerProfile
 from qingyan_agent.models import Target
 from qingyan_agent.universe import (
+    effective_user_text,
     infer_intent,
     infer_target,
     normalize_security_candidate,
+    parse_security_reference,
     security_search_queries,
+    target_resolution_notes,
     user_turn_texts,
 )
 
@@ -50,6 +61,16 @@ def test_greeting_and_security_query_extraction():
     assert infer_target("分析贝特瑞 835185") == Target("CNStock", "835185", confidence=78)
     assert tencent_market_symbol("920002") == "bj920002"
     assert cninfo_market_params("920002") == ("third", "bj")
+
+
+@pytest.mark.parametrize("prompt", [
+    "帮我分析一下长江电力（600900）最近的走势吧，顺便看看近期有没有重要公告，有哪些风险需要注意？",
+    "看看长江电力的技术面，还有没有什么重要消息",
+    "分析宁德时代最近行情，再说说公司公告",
+    "贵州茅台走势如何，有什么事件风险",
+])
+def test_natural_multi_topic_questions_resolve_to_full_research(prompt):
+    assert infer_intent(prompt) == "full_research"
 
 
 @pytest.mark.parametrize(("prompt", "expected_intent"), [
@@ -198,6 +219,194 @@ def test_multiturn_latest_user_target_overrides_earlier_target():
     target = infer_target(prompt)
     assert target is not None
     assert target.symbol == "600519"
+
+
+def test_latest_invalid_code_and_new_name_do_not_inherit_previous_security():
+    latest = "请分析吉林化纤004200近期走势，注明数据日期、均线结构、量能变化、趋势判断和主要风险。"
+    prompt = "\n".join([
+        "user: 请分析长江电力 600900 近期走势",
+        "assistant: 已完成长江电力分析。",
+        f"user: {latest}",
+    ])
+
+    reference = parse_security_reference(latest)
+
+    assert reference.raw_codes == ("004200",)
+    assert reference.valid_codes == ()
+    assert reference.name_queries == ("吉林化纤",)
+    assert infer_target(prompt) is None
+    assert security_search_queries(prompt, infer_target(prompt)) == ["吉林化纤"]
+
+
+def test_resolve_new_name_with_mistyped_code_and_expose_correction_note(monkeypatch, tmp_path):
+    client = make_client(tmp_path)
+    prompt = "\n".join([
+        "user: 分析长江电力 600900",
+        "assistant: 已完成。",
+        "user: 请分析吉林化纤004200近期走势",
+    ])
+    queries = []
+
+    def fake_request(method, url, **kwargs):
+        queries.append(kwargs["data"]["keyWord"])
+        return FakeResponse([{
+            "code": "000420",
+            "zwjc": "吉林化纤",
+            "orgId": "gssz0000420",
+            "category": "A股",
+        }])
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    target = client.resolve_target(prompt, infer_target(prompt))
+
+    assert queries == ["吉林化纤"]
+    assert target == Target("CNStock", "000420", "吉林化纤", "", 96, "gssz0000420")
+    assert target_resolution_notes("请分析吉林化纤004200近期走势", target) == [
+        "输入代码 004200 不是有效的公开 A 股代码；已按公司名称核验为吉林化纤（000420）。"
+    ]
+
+
+def test_resolve_name_only_switch_before_historical_target(monkeypatch, tmp_path):
+    client = make_client(tmp_path)
+    prompt = "user: 分析长江电力 600900\nassistant: 已完成\nuser: 换成吉林化纤"
+
+    def fake_request(method, url, **kwargs):
+        assert kwargs["data"]["keyWord"] == "吉林化纤"
+        return FakeResponse([{
+            "code": "000420",
+            "zwjc": "吉林化纤",
+            "orgId": "gssz0000420",
+            "category": "A股",
+        }])
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert infer_target(prompt) is None
+    assert client.resolve_target(prompt, infer_target(prompt)).symbol == "000420"
+
+
+def test_conflicting_valid_code_and_company_name_are_not_silently_resolved(monkeypatch, tmp_path):
+    client = make_client(tmp_path)
+    prompt = "user: 分析长江电力 600900\nassistant: 已完成\nuser: 分析吉林化纤 600900"
+
+    def fake_request(method, url, **kwargs):
+        query = kwargs["data"]["keyWord"]
+        if query == "600900":
+            return FakeResponse([{
+                "code": "600900",
+                "zwjc": "长江电力",
+                "orgId": "gssh0600900",
+                "category": "A股",
+            }])
+        assert query == "吉林化纤"
+        return FakeResponse([{
+            "code": "000420",
+            "zwjc": "吉林化纤",
+            "orgId": "gssz0000420",
+            "category": "A股",
+        }])
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    target = client.resolve_target(prompt, infer_target(prompt))
+
+    assert target is None
+    assert "名称与证券代码可能不一致" in target_resolution_notes(
+        "分析吉林化纤 600900",
+        target,
+    )[0]
+
+
+def test_latest_user_turn_controls_profile_without_assistant_text_pollution():
+    prompt = "\n".join([
+        "user: 请分析长江电力 600900 近期走势",
+        "assistant: 你还可以选择投研纪要简版，或查看贵州茅台 600519。",
+        "user: 继续分析长江电力 600900：技术面 + 公告事件版",
+    ])
+
+    current = effective_user_text(prompt)
+
+    assert current == "继续分析长江电力 600900：技术面 + 公告事件版"
+    assert "简版" not in current
+    assert "贵州茅台" not in current
+    assert resolve_answer_profile(current) == AnswerProfile.STANDARD
+    assert infer_intent(prompt) == "full_research"
+    assert infer_target(prompt).symbol == "600900"
+
+
+@pytest.mark.parametrize(("choice", "expected_text"), [
+    ("1", "纯技术面版"),
+    ("选2", "技术面 + 公告事件版"),
+    ("第三种", "综合研究投研纪要简版"),
+])
+def test_effective_user_text_expands_numeric_followup_without_assistant_context(choice, expected_text):
+    prompt = f"user: 分析长江电力 600900\nassistant: 可选三个版本\nuser: {choice}"
+
+    assert expected_text in effective_user_text(prompt)
+
+
+def test_intraday_bar_annotation_distinguishes_partial_and_completed_daily_bar():
+    intraday = {"data_date": "2026-08-17"}
+    completed = {"data_date": "2026-08-17"}
+
+    annotate_intraday_bar({"market_time": "20260817142838"}, intraday)
+    annotate_intraday_bar({"market_time": "20260817150100"}, completed)
+
+    assert intraday["is_intraday"] is True
+    assert intraday["bar_status"] == "intraday_partial"
+    assert intraday["market_snapshot_time"] == "20260817142838"
+    assert completed["is_intraday"] is False
+    assert completed["bar_status"] == "completed_daily_bar"
+
+
+def test_collect_only_calls_sources_required_by_current_topics(monkeypatch, tmp_path):
+    client = make_client(tmp_path)
+    target = Target("CNStock", "600900", "长江电力", confidence=96)
+    monkeypatch.setattr(client, "resolve_target", lambda prompt, inferred=None: target)
+    monkeypatch.setattr(client, "quote", lambda unused: {"price": 28.0, "source": "test"})
+    monkeypatch.setattr(client, "klines", lambda unused, limit: [])
+    monkeypatch.setattr(
+        client,
+        "fundamentals",
+        lambda unused: pytest.fail("technical scope must not fetch fundamentals"),
+    )
+    monkeypatch.setattr(
+        client,
+        "announcements",
+        lambda unused, include_text=False: pytest.fail("technical scope must not fetch announcements"),
+    )
+
+    result = client.collect(target, topics={"technical"})
+
+    assert result.quote["price"] == 28.0
+    assert result.fundamentals == {}
+    assert result.announcements == []
+    assert {status.source for status in result.statuses} == {"market_quote", "market_kline"}
+
+
+def test_fundamental_cache_is_normalized_before_reuse(monkeypatch, tmp_path):
+    client = AShareDataClient(Settings(
+        report_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+        enable_akshare=True,
+        llm_base_url="",
+        llm_api_key="",
+        llm_model="",
+    ))
+    cached = {
+        "日期": "2026-03-31",
+        "净资产收益率(%)": 2.97,
+        "销售毛利率(%)": float("nan"),
+        "source": "akshare_financial_analysis_indicator",
+    }
+    writes = []
+    monkeypatch.setattr(client, "_read_cache", lambda *args, **kwargs: cached)
+    monkeypatch.setattr(client, "_write_cache", lambda key, value: writes.append((key, value)))
+
+    result = client.fundamentals(Target("CNStock", "600900", "长江电力"))
+
+    assert "销售毛利率(%)" not in result
+    assert result["净资产收益率(%)"] == 2.97
+    assert writes and "销售毛利率(%)" not in writes[0][1]
 
 
 @pytest.mark.parametrize(("choice", "expected"), [
@@ -365,6 +574,31 @@ def test_kline_uses_tencent_and_writes_identity_cache(monkeypatch, tmp_path):
     assert len(cached["rows"]) == 20
 
 
+def test_enabling_fundamentals_ignores_old_disabled_metadata_cache(monkeypatch, tmp_path):
+    settings = Settings(
+        report_dir=tmp_path / "reports",
+        cache_dir=tmp_path / "cache",
+        enable_akshare=True,
+        llm_base_url="",
+        llm_api_key="",
+        llm_model="",
+    )
+    client = AShareDataClient(settings)
+    target = Target("CNStock", "600900", "长江电力", confidence=96)
+    client._write_cache("fundamental_600900.json", {
+        "_message": "optional akshare fundamentals disabled",
+    })
+    monkeypatch.setattr(client.fundamental_provider, "fundamentals", lambda unused: {
+        "净资产收益率(%)": 12.5,
+        "source": "akshare_financial_analysis_indicator",
+    })
+
+    result = client.fundamentals(target)
+
+    assert result["净资产收益率(%)"] == 12.5
+    assert "_message" not in result
+
+
 def test_announcements_use_org_id_and_drop_cross_symbol_rows(monkeypatch, tmp_path):
     client = make_client(tmp_path)
     target = Target("CNStock", "688011", "新光光电", confidence=96, org_id="9900038995")
@@ -444,3 +678,75 @@ def test_legacy_announcement_cache_is_rejected(tmp_path):
     client.settings.cache_dir.mkdir(parents=True, exist_ok=True)
     client._write_cache("announcements_688011.json", [{"title": "艾森股份错误公告"}])
     assert client._read_announcement_cache("announcements_688011.json", "688011") is None
+
+
+def test_technical_indicators_expose_auditable_research_methodology():
+    rows = []
+    for index in range(180):
+        close = 10 + index * 0.025 + ((index % 9) - 4) * 0.015
+        rows.append({
+            "date": f"2026-{(index // 28) + 1:02d}-{(index % 28) + 1:02d}",
+            "open": close - 0.03,
+            "close": close,
+            "high": close + 0.12,
+            "low": close - 0.11,
+            "volume": 100000 + index * 500,
+            "source": "test_qfq_kline",
+            "price_adjustment": "前复权",
+        })
+
+    result = technical_indicators(rows)
+
+    assert result["sample_size"] == 180
+    assert result["trend_rule_version"] == "QY-TECH-2.0"
+    assert result["trend_basis"]
+    assert result["relative_volume_definition"] == "最新交易日成交量/前19个交易日平均成交量"
+    assert result["relative_volume_baseline_days"] == 19
+    assert result["return_definition"].startswith("C_t/C_(t-20)-1")
+    assert result["rsi14"] is not None
+    assert result["atr14_pct"] is not None
+    assert result["max_drawdown_60d_pct"] <= 0
+    assert 0 <= result["range_position_60d_pct"] <= 100
+    assert result["volatility_percentile_in_sample_pct"] is not None
+
+
+def test_collect_runs_independent_sources_with_bounded_concurrency(monkeypatch, tmp_path):
+    client = make_client(tmp_path)
+    target = Target("CNStock", "600900", "长江电力", confidence=96, org_id="gssh0600900")
+    barrier = Barrier(4, timeout=2)
+
+    monkeypatch.setattr(client, "resolve_target", lambda prompt, existing=None: existing or target)
+
+    def quote(unused):
+        barrier.wait()
+        return {"symbol": target.symbol, "price": 28.1, "source": "test"}
+
+    def klines(unused, limit=180):
+        barrier.wait()
+        return [{
+            "date": f"2026-01-{(index % 28) + 1:02d}",
+            "close": 20 + index * 0.1,
+            "high": 20.2 + index * 0.1,
+            "low": 19.8 + index * 0.1,
+            "volume": 1000 + index,
+            "source": "test",
+        } for index in range(60)]
+
+    def fundamentals(unused):
+        barrier.wait()
+        return {"净资产收益率(%)": 10.0, "source": "test"}
+
+    def announcements(unused, *, include_text=False):
+        barrier.wait()
+        return [{"symbol": target.symbol, "title": "测试公告"}]
+
+    monkeypatch.setattr(client, "quote", quote)
+    monkeypatch.setattr(client, "klines", klines)
+    monkeypatch.setattr(client, "fundamentals", fundamentals)
+    monkeypatch.setattr(client, "announcements", announcements)
+
+    result = client.collect(target)
+
+    assert result.quote["price"] == 28.1
+    assert result.technical["sample_size"] == 60
+    assert all(not status.source.startswith("collect:") for status in result.statuses)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .data_sources import AShareDataClient
+from .data_sources import AShareDataClient, has_data_fields
 from .models import DataStatus, ScreeningResult, Target
 from .universe import DEFAULT_A_SHARE_UNIVERSE
 
@@ -66,13 +66,13 @@ def score_snapshot(snapshot) -> tuple[float, dict]:
         score += (risk_score - 50) * 0.18
         factors["volatility_control"] = round(risk_score, 2)
 
-    volume_ratio = tech.get("volume_ratio_20d")
+    volume_ratio = tech.get("relative_volume_20d")
     if volume_ratio is not None:
         liquidity_score = clamp(45 + min(volume_ratio, 3) * 15, 0, 100)
         score += (liquidity_score - 50) * 0.12
         factors["liquidity_activity"] = round(liquidity_score, 2)
 
-    if fundamentals:
+    if has_data_fields(fundamentals):
         quality_score = 55
         roe = first_number(fundamentals, ("净资产收益率(%)", "roe", "ROE"))
         debt = first_number(fundamentals, ("资产负债率(%)", "debt_ratio"))
@@ -97,11 +97,11 @@ def score_snapshot(snapshot) -> tuple[float, dict]:
 def risk_tags(snapshot, factors: dict) -> list[str]:
     tags = []
     tech = snapshot.technical or {}
-    if tech.get("annualized_volatility_pct") and tech["annualized_volatility_pct"] > 45:
+    if tech.get("annualized_volatility_pct") is not None and tech["annualized_volatility_pct"] > 45:
         tags.append("高波动")
-    if tech.get("volume_ratio_20d") and tech["volume_ratio_20d"] > 2.2:
+    if tech.get("relative_volume_20d") is not None and tech["relative_volume_20d"] > 2.2:
         tags.append("放量异动")
-    if not snapshot.fundamentals:
+    if not has_data_fields(snapshot.fundamentals):
         tags.append("财务字段待补充")
     if not snapshot.announcements:
         tags.append("公告检索待核验")

@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 
 
 @dataclass
@@ -130,15 +131,48 @@ def completion_response(
     }
 
 
+def append_artifact_links(content: str, attachments: list[dict[str, Any]] | None) -> str:
+    """Expose generated artifacts in the message when a client hides x_soda metadata."""
+    value = str(content or "").rstrip()
+    labels = {
+        "application/pdf": "下载 PDF 研报",
+        "text/markdown": "查看 Markdown 研报",
+        "image/png": "查看研究图表",
+    }
+    links = []
+    for attachment in attachments or []:
+        url = str(attachment.get("fileUrl") or "").strip()
+        mime = str(attachment.get("mimeType") or "").strip().lower()
+        label = labels.get(mime)
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        if not label or parsed.scheme not in {"http", "https"} or not parsed.netloc or url in value:
+            continue
+        links.append(f"- [{label}]({url})")
+    if not links:
+        return value
+    section = "## 研究报告附件\n" + "\n".join(links)
+    for marker in ("\n\n合规提示：", "\n\nCompliance note:"):
+        position = value.rfind(marker)
+        if position >= 0:
+            return value[:position].rstrip() + "\n\n" + section + value[position:]
+    return value + "\n\n" + section
+
+
 def stream_response(
     model: str,
     prompt: str,
     content: str,
     attachments: list[dict[str, Any]] | None = None,
     finish_reason: str = "stop",
+    *,
+    chat_id: str | None = None,
+    created: int | None = None,
 ) -> Iterable[str]:
-    chat_id = f"chatcmpl-{uuid.uuid4().hex}"
-    created = int(time.time())
+    chat_id = chat_id or f"chatcmpl-{uuid.uuid4().hex}"
+    created = created or int(time.time())
     yield "data: " + json.dumps({
         "id": chat_id,
         "object": "chat.completion.chunk",
@@ -165,6 +199,31 @@ def stream_response(
     }
     yield "data: " + json.dumps(stop, ensure_ascii=False) + "\n\n"
     yield "data: [DONE]\n\n"
+
+
+def progress_event(
+    model: str,
+    stage: str,
+    message: str,
+    *,
+    chat_id: str,
+    created: int,
+    event: str = "progress",
+) -> str:
+    """Emit an additive extension while preserving OpenAI chunk shape."""
+    payload = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+        "x_qingyan": {
+            "event": event,
+            "stage": stage,
+            "message": message,
+        },
+    }
+    return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
 
 def estimate_usage(prompt: str, content: str) -> dict[str, int]:
