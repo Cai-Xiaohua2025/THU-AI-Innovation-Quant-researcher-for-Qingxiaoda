@@ -468,6 +468,42 @@
       "created_unix": 1787017765,
       "expires_unix": 1787021365,
       "schema_version": 1
+    },
+    "811792e74fbf4ee8900a6f44649e3377": {
+      "artifact_id": "811792e74fbf4ee8900a6f44649e3377",
+      "filename": "长江电力走势与技术指标研究报告_20260818_233057_b68758c6.md",
+      "file_type": "text",
+      "mime_type": "text/markdown",
+      "file_size": 12741,
+      "sha256": "240e3a80f0d0a554b12f3efd33b4254686c77c359cf8989991664e2a7886e613",
+      "created_at": "2026-08-18T23:30:57+08:00",
+      "created_unix": 1787067057,
+      "expires_unix": 1787070657,
+      "schema_version": 1
+    },
+    "6dc4b428c21c441c852b426105a50d12": {
+      "artifact_id": "6dc4b428c21c441c852b426105a50d12",
+      "filename": "长江电力_价格趋势_price_20260818_233035_c52915cb.png",
+      "file_type": "image",
+      "mime_type": "image/png",
+      "file_size": 239524,
+      "sha256": "b689daed7b665ae76f2b79a9af4cf977a63608a5b125deee849b97e0dc892d0e",
+      "created_at": "2026-08-18T23:30:57+08:00",
+      "created_unix": 1787067057,
+      "expires_unix": 1787070657,
+      "schema_version": 1
+    },
+    "05f5665011f04d3faa3ccc5cd7adc705": {
+      "artifact_id": "05f5665011f04d3faa3ccc5cd7adc705",
+      "filename": "长江电力走势与技术指标研究报告_20260818_233057_b68758c6.pdf",
+      "file_type": "pdf",
+      "mime_type": "application/pdf",
+      "file_size": 325161,
+      "sha256": "6acaeff8a203b4c603a10631c6270241ef4d7fdc23a876febf205dde129d46c8",
+      "created_at": "2026-08-18T23:30:57+08:00",
+      "created_unix": 1787067057,
+      "expires_unix": 1787070657,
+      "schema_version": 1
     }
   }
 }
